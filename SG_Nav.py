@@ -39,23 +39,30 @@ from utils.image_process import (
 
 class SG_Nav_Agent():
     def __init__(self, task_config, args=None):
+        # Common
         self._POSSIBLE_ACTIONS = task_config.TASK.POSSIBLE_ACTIONS
         self.config = task_config
         self.args = args
         self.panoramic = []
         self.panoramic_depth = []
-        self.turn_angles = 0
         self.device = (
             torch.device("cuda:{}".format(0))
             if torch.cuda.is_available()
             else torch.device("cpu")
         )
+        self.turn_angles = 0
         self.prev_action = 0
         self.navigate_steps = 0
         self.move_steps = 0
         self.total_steps = 0
+
+        # Need to adjust how act will handle these variables in the case of exploration
         self.found_goal = False
         self.found_goal_times = 0
+        
+        # This needs
+        self.exploration_total_steps = 0
+        
         self.distance_threshold = 5
         self.correct_room = False
         self.changing_room = False
@@ -130,6 +137,17 @@ class SG_Nav_Agent():
         
         self.scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self)
 
+        # Need Separate global variables
+        self.global_scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self)
+
+        self.target_objects_list = [
+            'chair', 'table', 'bed', 'sofa', 'cabinet', 'plant', 'lamp', 'picture'
+        ]
+
+        self.target_object_idx = 0
+        self.found_objects = {}  # Track which objects have been found
+        
+        # This is to adjust the experiment
         self.experiment_name = 'experiment_0'
 
         if self.split:
@@ -160,6 +178,21 @@ class SG_Nav_Agent():
         model.add_rule(Rule('2: !RoomCooccur(R) & IsNearRoom(R,F) -> !Choose(F)^2'))
         model.add_rule(Rule('2: ShortDist(F) -> Choose(F)^2'))
         model.add_rule(Rule('Choose(+F) = 1 .'))
+    
+    def get_current_target_object(self):
+        """Get the current target object to search for"""
+        for obj in self.target_objects_list[self.target_object_idx:]:
+            if not self.found_objects[obj]:
+                return obj
+        return None
+
+    def update_target_object(self):
+        """Move to next unfound object in the list"""
+        for i, obj in enumerate(self.target_objects_list):
+            if not self.found_objects[obj]:
+                self.target_object_idx = i
+                return obj
+        return None
     
     def reset(self):
         self.navigate_steps = 0
@@ -221,6 +254,64 @@ class SG_Nav_Agent():
 
         self.scenegraph.reset()
         
+    def reset_local_scenegraph(self):
+        """Reset only the local scene graph after finding a goal object"""
+        self.total_steps = 0
+        self.found_goal = False
+        self.found_goal_times = 0
+        self.first_fbe = True
+        self.goal_map = np.zeros(self.full_map.shape[-2:])
+
+        if self.target_object_idx is not None and self.target_object_idx < len(self.target_objects_list): 
+            self.obj_goal = self.target_objects_list[self.target_object_idx]
+            self.obj_goal_sg = self.target_objects_list[self.target_object_idx]
+        if self.obj_goal == 'gym_equipment':
+            self.obj_goal_sg = 'treadmill. fitness equipment.'
+        elif self.obj_goal == 'chest_of_drawers':
+            self.obj_goal_sg = 'drawers'
+        elif self.obj_goal == 'tv_monitor':
+            self.obj_goal_sg = 'tv'
+
+        # -- TBD --
+        self.goal_loc = None
+        # -- TBD --
+
+        # Need to create one to initialize and set all the global scene variables of map
+        # so that local scene graph can be reset, but the global one is persistent
+        # Mainly need to set the fbe_free_map correctly.
+        # This method will be used to reset the key variables of the scene, from which the next goal detection will begin.
+        self.init_map()
+        self.prev_action = 0
+        self.former_collide = 0
+        self.goal_gps = np.array([0.,0.])
+        self.possible_goal_temp_gps = np.array([0.,0.])
+        self.last_gps = np.array([11100.,11100.])
+        self.last_loc = self.full_pose
+        self.panoramic = []
+        self.panoramic_depth = []
+        self.current_rooms = []
+        self.dist_to_frontier_goal = 10
+        self.found_possible_goal = False
+        self.history_pose = []
+        self.visualize_image_list = []
+        self.count_episodes = self.count_episodes + 1
+        self.loop_time = 0
+        self.last_segment_num = 0
+        self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
+        self.current_obj_predictions = []
+        self.obj_locations = [[] for i in range(21)]
+        self.not_move_steps = 0
+        self.move_since_random = 0
+        self.using_random_goal = False
+        self.fronter_this_ex = 0
+        self.random_this_ex = 0
+        self.last_location = np.array([0.,0.])
+        self.current_stuck_steps = 0
+        self.total_stuck_steps = 0
+        self.explanation = ''
+        self.text_node = ''
+        self.text_edge = ''
+
     def detect_objects(self, observations):
         self.current_obj_predictions = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], object_captions) # GLIP object detection, time cosuming
         new_labels = self.get_glip_real_label(self.current_obj_predictions) # transfer int labels to string labels
@@ -283,6 +374,7 @@ class SG_Nav_Agent():
                     if temp_distance >= self.distance_threshold:
                         self.found_possible_goal = True
                     else:
+                        # This is where the goal is marked as found, then in the action, it returns a stop or reset of the agent occurs
                         if self.found_goal:
                             if temp_distance < self.distance_threshold:
                                 self.found_goal_times = self.found_goal_times + 1
@@ -352,12 +444,21 @@ class SG_Nav_Agent():
                 elif not possible_goal_detected_before:
                     self.possible_goal_temp_gps = self.get_goal_gps(observations, shortest_distance_angle, shortest_distance)
             return
-                        
+
+    # Observations are the sensor informations       
     def act(self, observations):
         if self.total_steps >= 500:
             return {"action": 0}
         
         self.total_steps += 1
+        self.exploration_total_steps +=1
+
+        # Determine current target object
+        current_target = self.get_current_target_object()
+        if current_target is None:
+            # All objects found, episode complete
+            return {"action": 0}
+        
         if self.navigate_steps == 0:
             self.prob_array_room = self.co_occur_room_mtx[self.goal_idx[self.obj_goal]]
             self.prob_array_obj = self.co_occur_mtx[self.goal_idx[self.obj_goal]]
@@ -377,6 +478,15 @@ class SG_Nav_Agent():
         self.scenegraph.set_full_pose(self.full_pose)
         self.scenegraph.update_scenegraph()
         
+        # Update GLOBAL scene graph (persistent), needs to be changed
+        self.global_scenegraph.set_agent(self)
+        self.global_scenegraph.set_obj_goal(self.obj_goal, self.obj_goal_sg)
+        self.global_scenegraph.set_observations(observations)
+        self.global_scenegraph.set_full_map(self.full_map)
+        self.global_scenegraph.set_full_pose(self.full_pose)
+        self.global_scenegraph.update_scenegraph()
+
+        # Need Global ones too
         self.update_map(observations)
         self.update_free_map(observations)
         
