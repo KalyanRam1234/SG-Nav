@@ -109,8 +109,6 @@ class SG_Nav_Agent():
         self.collision_threshold = 0.08
         self.selem = skimage.morphology.square(1)
         self.explanation = ''
-        
-        self.init_map()
         self.sem_map_module = Semantic_Mapping(self).to(self.device) 
         self.free_map_module = Semantic_Mapping(self, max_height=10,min_height=-150).to(self.device)
         self.room_map_module = Semantic_Mapping(self, max_height=200,min_height=-10, num_cats=9).to(self.device)
@@ -121,6 +119,21 @@ class SG_Nav_Agent():
         self.sem_map_module.set_view_angles(self.camera_horizon)
         self.room_map_module.eval()
         self.room_map_module.set_view_angles(self.camera_horizon)
+
+        self.init_map()
+
+        # Adding global variables initialization
+        self.init_global_map()
+        self.global_sem_map_module = Semantic_Mapping(self).to(self.device)
+        self.global_sem_map_module.eval()
+        self.global_sem_map_module.set_view_angles(self.camera_horizon)
+
+        self.global_free_map_module = Semantic_Mapping(self, max_height=10,min_height=-150).to(self.device)
+        self.global_free_map_module.eval()
+        self.global_free_map_module.set_view_angles(self.camera_horizon)
+
+        self.global_room_map_module = Semantic_Mapping(self, max_height=200,min_height=-10, num_cats=9).to(self.device)
+        self.global_room_map_module.eval()
 
         self.camera_matrix = self.free_map_module.camera_matrix
         
@@ -181,6 +194,8 @@ class SG_Nav_Agent():
     
     def get_current_target_object(self):
         """Get the current target object to search for"""
+        # This needs to set the goal in the scene graph too
+        
         for obj in self.target_objects_list[self.target_object_idx:]:
             if not self.found_objects[obj]:
                 return obj
@@ -262,6 +277,7 @@ class SG_Nav_Agent():
         self.first_fbe = True
         self.goal_map = np.zeros(self.full_map.shape[-2:])
 
+        # should handle setting the goal for the next object
         if self.target_object_idx is not None and self.target_object_idx < len(self.target_objects_list): 
             self.obj_goal = self.target_objects_list[self.target_object_idx]
             self.obj_goal_sg = self.target_objects_list[self.target_object_idx]
@@ -297,6 +313,8 @@ class SG_Nav_Agent():
         self.count_episodes = self.count_episodes + 1
         self.loop_time = 0
         self.last_segment_num = 0
+
+        # need custom metrics for global scene graph
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
         self.current_obj_predictions = []
         self.obj_locations = [[] for i in range(21)]
@@ -313,6 +331,7 @@ class SG_Nav_Agent():
         self.text_edge = ''
 
     def detect_objects(self, observations):
+        # This variable only changes based on inference of current scene
         self.current_obj_predictions = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], object_captions) # GLIP object detection, time cosuming
         new_labels = self.get_glip_real_label(self.current_obj_predictions) # transfer int labels to string labels
         self.current_obj_predictions.add_field("labels", new_labels)
@@ -335,14 +354,18 @@ class SG_Nav_Agent():
                 bbox = self.current_obj_predictions.bbox[j].to(torch.int64)
                 center_point = (bbox[:2] + bbox[2:]) // 2
                 temp_direction = (center_point[0] - 320) * 79 / 640
+
+                # comes from observations, where act() will first initialize this variable.
                 temp_distance = self.depth[center_point[1],center_point[0],0]
                 if temp_distance >= self.distance_threshold:
                     continue
+
                 obj_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
                 x = int(self.map_size_cm/10-obj_gps[1]*100/self.resolution)
                 y = int(self.map_size_cm/10+obj_gps[0]*100/self.resolution)
                 self.obj_locations[categories_21_origin.index(label)].append([confidence, x, y])
         
+        # it is to be noted that the scenegraph.obj_goal is what will change, continue from here
         if self.scenegraph.obj_goal in self.scenegraph.small_objects:
             self.segment_num = len(self.scenegraph.segment2d_results)
             goal_mask = []
@@ -492,23 +515,35 @@ class SG_Nav_Agent():
         
         if self.total_steps == 1:
             self.sem_map_module.set_view_angles(30)
+            self.global_sem_map_module.set_view_angles(30)
+
             self.free_map_module.set_view_angles(30)
+            self.global_free_map_module.set_view_angles(30)
             return {"action": 5}
         elif self.total_steps <= 7:
             return {"action": 6}
         elif self.total_steps == 8:
             self.sem_map_module.set_view_angles(60)
+            self.global_sem_map_module.set_view_angles(60)
+
             self.free_map_module.set_view_angles(60)
+            self.global_free_map_module.set_view_angles(60)
             return {"action": 5}
         elif self.total_steps <= 14:
             return {"action": 6}
         elif self.total_steps <= 15:
             self.sem_map_module.set_view_angles(30)
+            self.global_sem_map_module.set_view_angles(30)
+
             self.free_map_module.set_view_angles(30)
+            self.global_free_map_module.set_view_angles(30)
             return {"action": 4}
         elif self.total_steps <= 16:
             self.sem_map_module.set_view_angles(0)
+            self.global_sem_map_module.set_view_angles(0)
+
             self.free_map_module.set_view_angles(0)
+            self.global_free_map_module.set_view_angles(0)
             return {"action": 4}
         if self.total_steps <= 22 and not self.found_goal:
             self.panoramic.append(observations["rgb"][:,:,[2,1,0]])
@@ -516,6 +551,10 @@ class SG_Nav_Agent():
             self.detect_objects(observations)
             room_detection_result = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], rooms_captions)
             self.update_room_map(observations, room_detection_result)
+
+            # adding global scene graph room information
+            self.update_global_room_map(observations, room_detection_result)
+
             if not self.found_goal: # if found a goal, directly go to it
                 return {"action": 6}
                     
@@ -699,6 +738,26 @@ class SG_Nav_Agent():
         phi = phi_world - agent_compass
         return np.array([rho, phi.item()], dtype=np.float32)
    
+    def init_global_map(self):
+        self.map_size = self.map_size_cm // self.map_resolution
+        full_w, full_h = self.map_size, self.map_size
+        self.global_full_map = torch.zeros(1,1 ,full_w, full_h).float().to(self.device)
+        self.global_room_map = torch.zeros(1,9 ,full_w, full_h).float().to(self.device)
+        self.global_visited = self.global_full_map[0,0].cpu().numpy()
+        self.global_collision_map = self.global_full_map[0,0].cpu().numpy()
+        self.global_fbe_free_map = copy.deepcopy(self.global_full_map).to(self.device) # 0 is unknown, 1 is free
+        self.global_full_pose = torch.zeros(3).float().to(self.device)
+        self.global_goal_gps_map = self.global_full_map[0,0].cpu().numpy()
+        self.global_origins = np.zeros((2))
+        
+        def init_map_and_pose():
+            self.global_full_map.fill_(0.)
+            self.global_full_pose.fill_(0.)
+            self.global_full_pose[:2] = self.map_size_cm / 100.0 / 2.0  # put the agent in the middle of the map
+
+        init_map_and_pose()
+        
+    # Added and used global version    
     def init_map(self):
         self.map_size = self.map_size_cm // self.map_resolution
         full_w, full_h = self.map_size, self.map_size
@@ -718,6 +777,13 @@ class SG_Nav_Agent():
 
         init_map_and_pose()
 
+    def update_global_map(self, observations):
+        self.global_full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
+        self.global_full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
+        self.global_full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
+        self.global_full_map = self.global_sem_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.global_full_pose, self.global_full_map)
+
+    # Added and used global version
     def update_map(self, observations):
         self.full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
         self.full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
@@ -731,6 +797,14 @@ class SG_Nav_Agent():
         self.fbe_free_map = self.free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.fbe_free_map)
         self.fbe_free_map[int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4, int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4] = 1
     
+    def update_global_free_map(self, observations):
+        self.global_full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
+        self.global_full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
+        self.global_full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
+        self.global_fbe_free_map = self.gloal_free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.global_full_pose, self.global_fbe_free_map)
+        self.global_fbe_free_map[int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4, int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4] = 1 
+
+    # Added and used global version
     def update_room_map(self, observations, room_prediction_result):
         new_room_labels = self.get_glip_real_label(room_prediction_result)
         type_mask = np.zeros((9,self.config.SIMULATOR.DEPTH_SENSOR.HEIGHT, self.config.SIMULATOR.DEPTH_SENSOR.WIDTH))
@@ -743,6 +817,18 @@ class SG_Nav_Agent():
             score_vec[idx] = room_prediction_result.get_field("scores")[i]
         self.room_map = self.room_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.room_map, torch.from_numpy(type_mask).to(self.device).type(torch.float32), score_vec)
     
+    def update_global_room_map(self, observations, room_prediction_result):
+        new_room_labels = self.get_glip_real_label(room_prediction_result)
+        type_mask = np.zeros((9,self.config.SIMULATOR.DEPTH_SENSOR.HEIGHT, self.config.SIMULATOR.DEPTH_SENSOR.WIDTH))
+        bboxs = room_prediction_result.bbox
+        score_vec = torch.zeros((9)).to(self.device)
+        for i, box in enumerate(bboxs):
+            box = box.to(torch.int64)
+            idx = rooms.index(new_room_labels[i])
+            type_mask[idx,box[1]:box[3],box[0]:box[2]] = 1
+            score_vec[idx] = room_prediction_result.get_field("scores")[i]
+        self.global_room_map = self.global_room_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.global_full_pose, self.global_room_map, torch.from_numpy(type_mask).to(self.device).type(torch.float32), score_vec)
+
     def get_traversible(self, map_pred, pose_pred):
         grid = np.rint(map_pred)
         start_x, start_y, start_o, gx1, gx2, gy1, gy2 = pose_pred
