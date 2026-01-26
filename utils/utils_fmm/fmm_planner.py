@@ -144,10 +144,10 @@ class FMMPlanner():
 
         if self.visualize:
             print("dist until goal is ", subset[self.du, self.du])
-        if subset[self.du, self.du] < stop_condition:
-            stop = True
-        else:
-            stop = False
+        # if subset[self.du, self.du] < stop_condition:
+        #     stop = True
+        # else:
+        stop = False
 
         subset -= subset[self.du, self.du] # dis change wrt agent point
         #ratio1 = subset / dist_mask

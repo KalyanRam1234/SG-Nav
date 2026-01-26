@@ -23,7 +23,7 @@ with open('tools/matterport_category_mappings.tsv') as file:
         if line_[-1] not in categories_40 and line_[-1] is not 'objects' and 'void' not in line_[-1]:
             categories_40.append(line_[-1])
 
-
+# this is important for later evaluation
 categories_21 = ['chair', 'table', 'picture', 'cabinet', 'cushion', 'sofa',
 'bed', 'chest_of_drawers', 'plant', 'sink', 'toilet', 'stool',
 'towel', 'tv_monitor', 'shower', 'bathtub', 'counter', 'fireplace', 'gym_equipment', 'seating', 'clothes']

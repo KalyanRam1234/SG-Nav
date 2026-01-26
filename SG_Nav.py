@@ -194,21 +194,25 @@ class SG_Nav_Agent():
     
     def get_current_target_object(self):
         """Get the current target object to search for"""
-        # This needs to set the goal in the scene graph too
+        if hasattr(self.scenegraph, 'obj_goal') and self.scenegraph.obj_goal not in self.target_objects_list:
+            self.target_objects_list = [self.scenegraph.obj_goal] + self.target_objects_list
         
-        for obj in self.target_objects_list[self.target_object_idx:]:
-            if not self.found_objects[obj]:
-                return obj
+        # Initialize found_objects dict if needed
+        for obj in self.target_objects_list:
+            if obj not in self.found_objects:
+                self.found_objects[obj] = False
+        
+        if self.target_object_idx >= len(self.target_objects_list):
+            return None
+        
+        current_target = self.target_objects_list[self.target_object_idx]
+        if not self.found_objects[current_target]:
+            self.obj_goal = current_target
+            self.obj_goal_sg = current_target
+            return current_target
+        
         return None
 
-    def update_target_object(self):
-        """Move to next unfound object in the list"""
-        for i, obj in enumerate(self.target_objects_list):
-            if not self.found_objects[obj]:
-                self.target_object_idx = i
-                return obj
-        return None
-    
     def reset(self):
         self.navigate_steps = 0
         self.turn_angles = 0
@@ -301,7 +305,6 @@ class SG_Nav_Agent():
         self.former_collide = 0
         self.goal_gps = np.array([0.,0.])
         self.possible_goal_temp_gps = np.array([0.,0.])
-        self.last_gps = np.array([11100.,11100.])
         self.last_loc = self.full_pose
         self.panoramic = []
         self.panoramic_depth = []
@@ -309,10 +312,11 @@ class SG_Nav_Agent():
         self.dist_to_frontier_goal = 10
         self.found_possible_goal = False
         self.history_pose = []
-        self.visualize_image_list = []
-        self.count_episodes = self.count_episodes + 1
+        # Re-add current pose to history after reset (for visualization and tracking)
+        if hasattr(self, 'full_pose'):
+            self.history_pose.append(self.full_pose.cpu().detach().clone())
+            print(f"[Reset] Re-initialized history_pose with current agent pose")
         self.loop_time = 0
-        self.last_segment_num = 0
 
         # need custom metrics for global scene graph
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
@@ -329,6 +333,11 @@ class SG_Nav_Agent():
         self.explanation = ''
         self.text_node = ''
         self.text_edge = ''
+        
+        # IMPORTANT: Reset the local scene graph nodes and edges (but NOT global)
+        print(f"[Reset] Resetting LOCAL scene graph (nodes and edges)")
+        self.scenegraph.reset()
+        print(f"[Reset] LOCAL scene graph reset - Nodes: {len(self.scenegraph.nodes)}, Edges: {len(self.scenegraph.get_edges())}")
 
     def detect_objects(self, observations):
         # This variable only changes based on inference of current scene
@@ -365,10 +374,11 @@ class SG_Nav_Agent():
                 y = int(self.map_size_cm/10+obj_gps[0]*100/self.resolution)
                 self.obj_locations[categories_21_origin.index(label)].append([confidence, x, y])
         
-        # it is to be noted that the scenegraph.obj_goal is what will change, continue from here
+        # it is to be noted that the scenegraph.obj_goal is what will change,  this is for smaller object detection
         if self.scenegraph.obj_goal in self.scenegraph.small_objects:
             self.segment_num = len(self.scenegraph.segment2d_results)
             goal_mask = []
+            # comes from scenegraph update
             if self.segment_num > self.last_segment_num:
                 self.last_segment_num = self.segment_num
                 segment2d_result = self.scenegraph.segment2d_results[-1]
@@ -385,6 +395,7 @@ class SG_Nav_Agent():
                     center_point = torch.tensor(np.argwhere(mask).mean(axis=0).astype(int))
                     center_point = torch.tensor([center_point[1], center_point[0]])
                     temp_direction = (center_point[0] - 320) * 79 / 640
+                    # self.depth comes from the act() observations
                     temp_distance = self.depth[center_point[1],center_point[0],0]
                     k = 0
                     pos_neg = 1
@@ -417,11 +428,13 @@ class SG_Nav_Agent():
                     # if detected a long goal before, then don't change it until see a goal within 5 meters
                     self.possible_goal_temp_gps = self.get_goal_gps(observations, shortest_distance_angle, shortest_distance)
             else:
+                # means goal mask isn't found in current observation
                 if self.found_goal:
                     self.found_goal = False
                     self.found_goal_times = 0
             return
         else:
+            # This is to handle detection of larger objects
             if len(goal_bbox) > 0:
                 possible_goal_detected_before = copy.deepcopy(self.found_possible_goal)
                 goal_prediction.bbox = torch.stack(goal_bbox)
@@ -468,29 +481,102 @@ class SG_Nav_Agent():
                     self.possible_goal_temp_gps = self.get_goal_gps(observations, shortest_distance_angle, shortest_distance)
             return
 
+    def get_global_metrics(self):
+        """Calculate and return global scene graph metrics"""
+        # Calculate global free map coverage percentage
+        if hasattr(self, 'global_fbe_free_map') and self.global_fbe_free_map is not None:
+            # Convert tensor to numpy/float for safe computation
+            fbe_map = self.global_fbe_free_map
+            if isinstance(fbe_map, torch.Tensor):
+                fbe_map = fbe_map.cpu().numpy()
+            fbe_free_coverage = (fbe_map > 0.5).sum() / fbe_map.size * 100
+        else:
+            fbe_free_coverage = 0.0
+        
+        # Calculate global visited map percentage
+        if hasattr(self, 'global_visited') and self.global_visited is not None:
+            # Convert tensor to numpy/float for safe computation
+            visited_map = self.global_visited
+            if isinstance(visited_map, torch.Tensor):
+                visited_map = visited_map.cpu().numpy()
+            visited_coverage = (visited_map > 0.5).sum() / visited_map.size * 100
+        else:
+            visited_coverage = 0.0
+        
+        # Get number of nodes and edges in global scene graph
+        if hasattr(self, 'global_scenegraph'):
+            num_nodes = len(self.global_scenegraph.nodes)
+            num_edges = len(self.global_scenegraph.get_edges())
+        else:
+            num_nodes = 0
+            num_edges = 0
+        
+        return {
+            'global_fbe_free_coverage': fbe_free_coverage,
+            'global_visited_coverage': visited_coverage,
+            'num_nodes': num_nodes,
+            'num_edges': num_edges
+        }
+    
+    def print_metrics(self):
+        """Print verbose metrics at each step"""
+        metrics = self.get_global_metrics()
+        print(f"\n[Step {self.total_steps:4d}] [Nav Step {self.navigate_steps:4d}] "
+              f"Global FBE Free Coverage: {metrics['global_fbe_free_coverage']:6.2f}% | "
+              f"Global Visited: {metrics['global_visited_coverage']:6.2f}% | "
+              f"Nodes: {metrics['num_nodes']:3d} | "
+              f"Edges: {metrics['num_edges']:3d} | "
+              f"Target: {self.obj_goal}")
+
     # Observations are the sensor informations       
     def act(self, observations):
         if self.total_steps >= 500:
-            return {"action": 0}
+            print(f"[Act] Max steps reached: {self.total_steps}")
+            self.found_objects[self.obj_goal] = False
+            self.target_object_idx += 1
+            
+            # Transition to next goal if available
+            if self.target_object_idx < len(self.target_objects_list):
+                print(f"[Act] Transitioning to next goal: {self.target_objects_list[self.target_object_idx]}")
+                # Save video for the object that was just found BEFORE resetting
+                if self.args.visualize:
+                    print(f"[Act] Saving video for object: {self.obj_goal}")
+                    self.save_video_for_object(self.obj_goal)
+                self.reset_local_scenegraph()
+            else:
+                # All objects found
+                print(f"[Act] All target objects found! Episode complete.")
+                # Save final video for last object
+                if self.args.visualize:
+                    self.save_video()
+                return {"action": 0}
         
         self.total_steps += 1
         self.exploration_total_steps +=1
 
         # Determine current target object
+        print(f"\n{'='*100}")
+        print(f"[Act] Step {self.total_steps} - Determining current target object...")
         current_target = self.get_current_target_object()
         if current_target is None:
             # All objects found, episode complete
+            print(f"[Act] All target objects found! Episode complete.")
+            self.save_video()
             return {"action": 0}
+        print(f"[Act] Current target object: {current_target}")
         
         if self.navigate_steps == 0:
+            print(f"[Act] Initialize goal probabilities for: {self.obj_goal}")
             self.prob_array_room = self.co_occur_room_mtx[self.goal_idx[self.obj_goal]]
             self.prob_array_obj = self.co_occur_mtx[self.goal_idx[self.obj_goal]]
 
+        print(f"[Act] Processing observations - depth clipping...")
         observations["depth"][observations["depth"]==0.5] = 100 # don't construct unprecise map with distance less than 0.5 m
         self.depth = observations["depth"]
         self.rgb = observations["rgb"][:,:,[2,1,0]]
         self.rgb_visualization = observations["rgb"]
 
+        print(f"[Act] Updating LOCAL scene graph...")
         self.scenegraph.set_agent(self)
         self.scenegraph.set_navigate_steps(self.navigate_steps)
         self.scenegraph.set_obj_goal(self.obj_goal, self.obj_goal_sg)
@@ -500,29 +586,46 @@ class SG_Nav_Agent():
         self.scenegraph.set_full_map(self.full_map)
         self.scenegraph.set_full_pose(self.full_pose)
         self.scenegraph.update_scenegraph()
+        print(f"[Act] LOCAL scene graph updated - Nodes: {len(self.scenegraph.nodes)}, Edges: {len(self.scenegraph.get_edges())}")
         
-        # Update GLOBAL scene graph (persistent), needs to be changed
+        # Update GLOBAL scene graph (persistent)
+        print(f"[Act] Updating GLOBAL scene graph...")
         self.global_scenegraph.set_agent(self)
+        self.global_scenegraph.set_navigate_steps(self.navigate_steps)
         self.global_scenegraph.set_obj_goal(self.obj_goal, self.obj_goal_sg)
+        self.global_scenegraph.set_room_map(self.global_room_map)
+        self.global_scenegraph.set_fbe_free_map(self.global_fbe_free_map)
         self.global_scenegraph.set_observations(observations)
-        self.global_scenegraph.set_full_map(self.full_map)
+        self.global_scenegraph.set_full_map(self.global_full_map)
         self.global_scenegraph.set_full_pose(self.full_pose)
         self.global_scenegraph.update_scenegraph()
+        print(f"[Act] GLOBAL scene graph updated - Nodes: {len(self.global_scenegraph.nodes)}, Edges: {len(self.global_scenegraph.get_edges())}")
 
-        # Need Global ones too
+        # Need Global ones too, done
+        print(f"[Act] Updating local maps...")
         self.update_map(observations)
         self.update_free_map(observations)
         
+        print(f"[Act] Updating global maps...")
+        self.update_global_free_map(observations)
+        self.update_global_map(observations)
+        
+        print(f"[Act] Maps updated successfully")
+
         if self.total_steps == 1:
+            print(f"[Act] Step 1: Setting view angle to 30 degrees (initial lookup)")
             self.sem_map_module.set_view_angles(30)
             self.global_sem_map_module.set_view_angles(30)
 
             self.free_map_module.set_view_angles(30)
             self.global_free_map_module.set_view_angles(30)
+            self.print_metrics()
             return {"action": 5}
         elif self.total_steps <= 7:
+            print(f"[Act] Steps 2-7: Panoramic rotation (right)")
             return {"action": 6}
         elif self.total_steps == 8:
+            print(f"[Act] Step 8: Setting view angle to 60 degrees (upward)")
             self.sem_map_module.set_view_angles(60)
             self.global_sem_map_module.set_view_angles(60)
 
@@ -530,8 +633,10 @@ class SG_Nav_Agent():
             self.global_free_map_module.set_view_angles(60)
             return {"action": 5}
         elif self.total_steps <= 14:
+            print(f"[Act] Steps 9-14: Panoramic rotation (right) at high angle")
             return {"action": 6}
         elif self.total_steps <= 15:
+            print(f"[Act] Step 15: Setting view angle back to 30 degrees")
             self.sem_map_module.set_view_angles(30)
             self.global_sem_map_module.set_view_angles(30)
 
@@ -539,6 +644,7 @@ class SG_Nav_Agent():
             self.global_free_map_module.set_view_angles(30)
             return {"action": 4}
         elif self.total_steps <= 16:
+            print(f"[Act] Step 16: Setting view angle to 0 degrees (forward)")
             self.sem_map_module.set_view_angles(0)
             self.global_sem_map_module.set_view_angles(0)
 
@@ -546,16 +652,24 @@ class SG_Nav_Agent():
             self.global_free_map_module.set_view_angles(0)
             return {"action": 4}
         if self.total_steps <= 22 and not self.found_goal:
+            print(f"[Act] Steps 1-22: Initial panoramic exploration")
             self.panoramic.append(observations["rgb"][:,:,[2,1,0]])
             self.panoramic_depth.append(observations["depth"])
+            # This gets triggered regularly
+            print(f"[Act] Detecting objects in current view...")
             self.detect_objects(observations)
+            print(f"[Act] Detecting room layout...")
             room_detection_result = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], rooms_captions)
             self.update_room_map(observations, room_detection_result)
+            print(f"[Act] Updating LOCAL room map")
 
             # adding global scene graph room information
+            print(f"[Act] Updating GLOBAL room map")
             self.update_global_room_map(observations, room_detection_result)
 
             if not self.found_goal: # if found a goal, directly go to it
+                print(f"[Act] Goal not found yet, continuing panoramic rotation")
+                self.print_metrics()
                 return {"action": 6}
                     
         if np.linalg.norm(observations["gps"] - self.last_gps) >= 0.05:
@@ -563,14 +677,21 @@ class SG_Nav_Agent():
             self.not_move_steps = 0
             if self.using_random_goal:
                 self.move_since_random += 1
+            print(f"[Act] Agent moved - Move steps: {self.move_steps}")
         else:
             self.not_move_steps += 1
+            print(f"[Act] Agent stationary - Not move steps: {self.not_move_steps}")
             
         self.last_gps = observations["gps"]
         
+        # only doing once is fine since they refer to same agent
+        print(f"[Act] Running scene graph perception...")
         self.scenegraph.perception()
           
         self.history_pose.append(self.full_pose.cpu().detach().clone())
+        print(f"[Act] Recorded agent pose - History length: {len(self.history_pose)}")
+        
+        print(f"[Act] Computing traversible map from agent pose...")
         input_pose = np.zeros(7)
         input_pose[:3] = self.full_pose.cpu().numpy()
         input_pose[1] = self.map_size_cm/100 - input_pose[1]
@@ -578,71 +699,118 @@ class SG_Nav_Agent():
         input_pose[4] = self.full_map.shape[-2]
         input_pose[6] = self.full_map.shape[-1]
         traversible, cur_start, cur_start_o = self.get_traversible(self.full_map.cpu().numpy()[0,0,::-1], input_pose)
+        print(f"[Act] Traversible map computed - Agent position: ({cur_start[0]:.2f}, {cur_start[1]:.2f}), Orientation: {cur_start_o:.2f}°")
         
         if self.found_goal: 
+            print(f"[Act] GOAL FOUND! {self.obj_goal}")
+            self.found_objects[self.obj_goal] = True
+            self.target_object_idx += 1
+            
+            # Transition to next goal if available
+            if self.target_object_idx < len(self.target_objects_list):
+                print(f"[Act] Transitioning to next goal: {self.target_objects_list[self.target_object_idx]}")
+                # Save video for the object that was just found BEFORE resetting
+                if self.args.visualize:
+                    print(f"[Act] Saving video for object: {self.obj_goal}")
+                    self.save_video_for_object(self.obj_goal)
+                self.reset_local_scenegraph()
+            else:
+                # All objects found
+                print(f"[Act] All target objects found! Episode complete.")
+                # Save final video for last object
+                if self.args.visualize:
+                    self.save_video()
+                return {"action": 0}
+            
             self.not_use_random_goal()
             self.goal_map = np.zeros(self.full_map.shape[-2:])
             self.goal_map[max(0,min(self.map_size - 1,int(self.map_size_cm/10+self.goal_gps[1]*100/self.resolution))), max(0,min(self.map_size - 1,int(self.map_size_cm/10+self.goal_gps[0]*100/self.resolution)))] = 1
         elif self.found_possible_goal: 
+            print(f"[Act] Possible goal found, navigating to it...")
             self.not_use_random_goal()
             self.goal_map = np.zeros(self.full_map.shape[-2:])
             self.goal_map[max(0,min(self.map_size - 1,int(self.map_size_cm/10+self.possible_goal_temp_gps[1]*100/self.resolution))), max(0,min(self.map_size - 1,int(self.map_size_cm/10+self.possible_goal_temp_gps[0]*100/self.resolution)))] = 1
         elif self.first_fbe:
+            print(f"[Act] First frontier-based exploration, computing FBE goal...")
             self.goal_loc = self.fbe(traversible, cur_start)
             self.not_use_random_goal()
             self.first_fbe = False
             self.goal_map = np.zeros(self.full_map.shape[-2:])
             if self.goal_loc is None:
+                print(f"[Act] FBE returned None, using random goal")
                 self.random_this_ex += 1
                 self.goal_map = self.set_random_goal()
                 self.using_random_goal = True
             else:
+                print(f"[Act] FBE found frontier at: {self.goal_loc}")
                 self.fronter_this_ex += 1
                 self.goal_map[self.goal_loc[0], self.goal_loc[1]] = 1
                 self.goal_map = self.goal_map[::-1]
         
         # local policy
+        print(f"[Act] Computing local policy (short-term goal)...")
         stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
+        print(f"[Act] Short-term goal: ({stg_y:.2f}, {stg_x:.2f}), Action: {number_action}, Replan: {replan}")
+        
         if self.found_possible_goal and number_action == 0:
+            print(f"[Act] Possible goal reached, clearing goal flag")
             self.found_possible_goal = False
         
         # reach long-term goal and fbe
+        # this is essentially to reselect goal when current goal is unreachable
+        print(f"[Act] Checking goal status - found_goal: {self.found_goal}, found_possible_goal: {self.found_possible_goal}, action: {number_action}")
         if (not self.found_goal and not self.found_possible_goal and number_action == 0) or (self.using_random_goal and self.move_since_random > 20): 
+            print(f"[Act] Reselecting goal - Goal unreachable or random goal expired")
             if (self.using_random_goal and self.move_since_random > 20):
+                print(f"[Act] Random goal expired after {self.move_since_random} steps, blocking previous area")
                 goal_x, goal_y = np.where(self.goal_map == 1)
                 x_0 = max(goal_x[0] - 8, 0)
                 y_0 = max(goal_y[0] - 8, 0)
                 x_1 = min(goal_x[0] + 8, self.map_size)
                 y_1 = min(goal_y[0] + 8, self.map_size)
                 self.fbe_free_map[x_0:x_1, y_0:y_1] = 0
+                self.global_fbe_free_map[x_0:x_1, y_0:y_1] = 0
+            print(f"[Act] Computing new FBE goal...")
             self.goal_loc = self.fbe(traversible, cur_start)
             self.not_use_random_goal()
             self.goal_map = np.zeros(self.full_map.shape[-2:])
             if self.goal_loc is None:
+                print(f"[Act] FBE returned None, using random goal")
                 self.random_this_ex += 1
                 self.goal_map = self.set_random_goal()
                 self.using_random_goal = True
             else:
+                print(f"[Act] FBE found new frontier at: {self.goal_loc}")
                 self.fronter_this_ex += 1
                 self.goal_map[self.goal_loc[0], self.goal_loc[1]] = 1
                 self.goal_map = self.goal_map[::-1]
+            print(f"[Act] Recomputing local policy with new goal...")
             stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
+            print(f"[Act] New short-term goal: ({stg_y:.2f}, {stg_x:.2f}), Action: {number_action}")
         
         self.loop_time = 0
+        # another attempt to replan when stuck
+        print(f"[Act] Stuck detection - not_move_steps: {self.not_move_steps}, found_goal: {self.found_goal}, action: {number_action}")
         while (not self.found_goal and number_action == 0) or self.not_move_steps >= 7:
+            print(f"[Act] Agent stuck! Attempting to unstuck (attempt {self.loop_time + 1}/20)")
             if self.not_move_steps >= 7:
+                print(f"[Act] Stationary for {self.not_move_steps} steps, resetting goal flags")
                 self.found_goal = False
                 self.found_possible_goal = False
             self.loop_time += 1
             self.random_this_ex += 1
             if self.loop_time > 20:
+                print(f"[Act] Failed to unstuck after 20 attempts, giving up")
                 return {"action": 0}
             self.not_move_steps = 0
+            print(f"[Act] Setting random goal to escape stuck position")
             self.goal_map = self.set_random_goal()
             self.using_random_goal = True
             stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
+            print(f"[Act] Retry {self.loop_time}: New action: {number_action}")
         
         if self.args.visualize:
+            print(f"[Act] Generating visualization...")
             self.visualize(traversible, observations, number_action)
 
         observations["pointgoal_with_gps_compass"] = self.get_relative_goal_gps(observations)
@@ -650,6 +818,13 @@ class SG_Nav_Agent():
         self.last_loc = copy.deepcopy(self.full_pose)
         self.prev_action = number_action
         self.navigate_steps += 1
+        
+        # Print final metrics and statistics
+        self.print_metrics()
+        print(f"[Act] Final action: {number_action} | Fronts: {self.fronter_this_ex} | Random: {self.random_this_ex} | Move steps: {self.move_steps}")
+        print(f"[Act] Objects found: {sum(self.found_objects.values())}/{len(self.target_objects_list)}")
+        print(f"{'='*100}\n")
+        
         torch.cuda.empty_cache()
         
         return {"action": number_action}
@@ -746,16 +921,7 @@ class SG_Nav_Agent():
         self.global_visited = self.global_full_map[0,0].cpu().numpy()
         self.global_collision_map = self.global_full_map[0,0].cpu().numpy()
         self.global_fbe_free_map = copy.deepcopy(self.global_full_map).to(self.device) # 0 is unknown, 1 is free
-        self.global_full_pose = torch.zeros(3).float().to(self.device)
-        self.global_goal_gps_map = self.global_full_map[0,0].cpu().numpy()
         self.global_origins = np.zeros((2))
-        
-        def init_map_and_pose():
-            self.global_full_map.fill_(0.)
-            self.global_full_pose.fill_(0.)
-            self.global_full_pose[:2] = self.map_size_cm / 100.0 / 2.0  # put the agent in the middle of the map
-
-        init_map_and_pose()
         
     # Added and used global version    
     def init_map(self):
@@ -778,10 +944,10 @@ class SG_Nav_Agent():
         init_map_and_pose()
 
     def update_global_map(self, observations):
-        self.global_full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
-        self.global_full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
-        self.global_full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
-        self.global_full_map = self.global_sem_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.global_full_pose, self.global_full_map)
+        self.full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
+        self.full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
+        self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
+        self.global_full_map = self.global_sem_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.global_full_map)
 
     # Added and used global version
     def update_map(self, observations):
@@ -798,10 +964,10 @@ class SG_Nav_Agent():
         self.fbe_free_map[int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4, int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4] = 1
     
     def update_global_free_map(self, observations):
-        self.global_full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
-        self.global_full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
-        self.global_full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
-        self.global_fbe_free_map = self.gloal_free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.global_full_pose, self.global_fbe_free_map)
+        self.full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
+        self.full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
+        self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
+        self.global_fbe_free_map = self.global_free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.global_fbe_free_map)
         self.global_fbe_free_map[int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4, int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4] = 1 
 
     # Added and used global version
@@ -827,7 +993,7 @@ class SG_Nav_Agent():
             idx = rooms.index(new_room_labels[i])
             type_mask[idx,box[1]:box[3],box[0]:box[2]] = 1
             score_vec[idx] = room_prediction_result.get_field("scores")[i]
-        self.global_room_map = self.global_room_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.global_full_pose, self.global_room_map, torch.from_numpy(type_mask).to(self.device).type(torch.float32), score_vec)
+        self.global_room_map = self.global_room_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.global_room_map, torch.from_numpy(type_mask).to(self.device).type(torch.float32), score_vec)
 
     def get_traversible(self, map_pred, pose_pred):
         grid = np.rint(map_pred)
@@ -839,6 +1005,8 @@ class SG_Nav_Agent():
                  int(c*100/self.map_resolution - gx1)]
         start = pu.threshold_poses(start, grid.shape)
         self.visited[gy1:gy2, gx1:gx2][start[0]-2:start[0]+3,
+                                       start[1]-2:start[1]+3] = 1
+        self.global_visited[gy1:gy2, gx1:gx2][start[0]-2:start[0]+3,
                                        start[1]-2:start[1]+3] = 1
         def add_boundary(mat, value=1):
             h, w = mat.shape
@@ -874,6 +1042,7 @@ class SG_Nav_Agent():
         return traversible, start, start_o
     
     def _plan(self, traversible, goal_map, agent_pose, start, start_o, goal_found):
+        # how to move forward if previous action is move forward
         if self.prev_action == 1:
             x1, y1, t1 = self.last_loc.cpu().numpy()
             x2, y2, t2 = self.full_pose.cpu()
@@ -900,6 +1069,7 @@ class SG_Nav_Agent():
             else:
                 self.former_collide = 0
 
+        # This tells what to do next
         stg, replan, stop, = self._get_stg(traversible, start, np.copy(goal_map), goal_found)
 
         # Deterministic Local Policy
@@ -918,6 +1088,7 @@ class SG_Nav_Agent():
             relative_angle = (angle_st_goal- angle_agent)%360.0
             if relative_angle > 180:
                 relative_angle -= 360
+
             if self.former_collide < 10:
                 if relative_angle > 16:
                     action = 3 # Right
@@ -940,6 +1111,7 @@ class SG_Nav_Agent():
         return stg_y, stg_x, replan, action
     
     def _get_stg(self, traversible, start, goal, goal_found):
+        """Modified short-term goal planning for exploration"""
         def add_boundary(mat, value=1):
             h, w = mat.shape
             new_mat = np.zeros((h+2,w+2)) + value
@@ -969,6 +1141,8 @@ class SG_Nav_Agent():
         decrease_stop_cond =0
         if self.dilation_deg >= 6:
             decrease_stop_cond = 0.2 #decrease to 0.2 (7 grids until closest goal)
+        
+        # need a way to control replan frequency and stop condition for exploration scenario
         stg_y, stg_x, replan, stop = self.planner.get_short_term_goal(state, found_goal = goal_found, decrease_stop_cond=decrease_stop_cond)
         stg_x, stg_y = stg_x - 1, stg_y - 1
         
@@ -1007,13 +1181,21 @@ class SG_Nav_Agent():
             unknown_rgb = colors.to_rgb('#FFFFFF')
             paper_map_trans[:,:,:] = torch.tensor( unknown_rgb)
             free_rgb = colors.to_rgb('#E7E7E7')
-            paper_map_trans[self.fbe_free_map.cpu().numpy()[0,0,::-1]>0.5,:] = torch.tensor( free_rgb).double()
+            # paper_map_trans[self.fbe_free_map.cpu().numpy()[0,0,::-1]>0.5,:] = torch.tensor( free_rgb).double()
+            paper_map_trans[self.global_fbe_free_map.cpu().numpy()[0,0,::-1]>0.5,:] = torch.tensor( free_rgb).double()
             obstacle_rgb = colors.to_rgb('#A2A2A2')
             paper_map_trans[skimage.morphology.binary_dilation(self.full_map.cpu().numpy()[0,0,::-1]>0.5,skimage.morphology.disk(1)),:] = torch.tensor(obstacle_rgb).double()
             paper_map_trans = paper_map_trans.permute(2,0,1)
             self.visualize_agent_and_goal(paper_map_trans)
-            agent_coordinate = (int(self.history_pose[-1][0]*100/self.resolution), int((self.map_size_cm/100-self.history_pose[-1][1])*100/self.resolution))
-            occupancy_map = crop_around_point((paper_map_trans.permute(1, 2, 0) * 255).numpy().astype(np.uint8), agent_coordinate, (150, 200))
+            
+            # Guard against empty history_pose (can happen after reset_local_scenegraph)
+            if len(self.history_pose) > 0:
+                agent_coordinate = (int(self.history_pose[-1][0]*100/self.resolution), int((self.map_size_cm/100-self.history_pose[-1][1])*100/self.resolution))
+                occupancy_map = crop_around_point((paper_map_trans.permute(1, 2, 0) * 255).numpy().astype(np.uint8), agent_coordinate, (150, 200))
+            else:
+                # If history_pose is empty, skip visualization for this step
+                print(f"[Visualize] Skipping visualization - history_pose is empty (likely after goal reset)")
+                return
             visualize_image = np.full((450, 800, 3), 255, dtype=np.uint8)
             visualize_image = add_resized_image(visualize_image, self.rgb_visualization, (10, 60), (320, 240))
             visualize_image = add_resized_image(visualize_image, occupancy_map, (340, 60), (180, 240))
@@ -1035,7 +1217,7 @@ class SG_Nav_Agent():
 
     def save_video(self):
         save_video_dir = os.path.join(self.visualization_dir, 'video')
-        save_video_path = f'{save_video_dir}/vid_{self.count_episodes:06d}.mp4'
+        save_video_path = f'{save_video_dir}/vid_exploration_{self.count_episodes:06d}.mp4'
         if not os.path.exists(save_video_dir):
             os.makedirs(save_video_dir)
         height, width, layers = self.visualize_image_list[0].shape
@@ -1044,6 +1226,29 @@ class SG_Nav_Agent():
         for visualize_image in self.visualize_image_list:  
             video.write(visualize_image)
         video.release()
+    
+    def save_video_for_object(self, obj_name):
+        """Save video for a specific object that was just found"""
+        if len(self.visualize_image_list) == 0:
+            print(f"[Save Video] No visualizations to save for object: {obj_name}")
+            return
+        
+        save_video_dir = os.path.join(self.visualization_dir, 'video')
+        save_video_path = f'{save_video_dir}/vid_{obj_name}_episode_incremental_goal_{self.target_object_idx:06d}.mp4'
+        
+        if not os.path.exists(save_video_dir):
+            os.makedirs(save_video_dir)
+        
+        try:
+            height, width, layers = self.visualize_image_list[0].shape
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video = cv2.VideoWriter(save_video_path, fourcc, 4.0, (width, height))
+            for visualize_image in self.visualize_image_list:  
+                video.write(visualize_image)
+            video.release()
+            print(f"[Save Video] Saved video for object '{obj_name}' with {len(self.visualize_image_list)} frames to {save_video_path}")
+        except Exception as e:
+            print(f"[Save Video] Error saving video for object '{obj_name}': {e}")
 
     def visualize_agent_and_goal(self, map):
         for idx, pose in enumerate(self.history_pose):
