@@ -276,6 +276,8 @@ class SG_Nav_Agent():
     def reset_local_scenegraph(self):
         """Reset only the local scene graph after finding a goal object"""
         self.total_steps = 0
+        self.navigate_steps = 0
+        self.move_steps = 0
         self.found_goal = False
         self.found_goal_times = 0
         self.first_fbe = True
@@ -891,6 +893,10 @@ class SG_Nav_Agent():
         idx_16_max = idx_16[0][np.argmax(scores)]
         goal = frontier_locations[idx_16_max] - 1
         self.scores = scores
+
+        # Clean up GPU tensors
+        del fbe_map, fbe_cp, fbe_cpp
+
         return goal
         
     def get_goal_gps(self, observations, angle, distance):
@@ -920,7 +926,9 @@ class SG_Nav_Agent():
         self.global_room_map = torch.zeros(1,9 ,full_w, full_h).float().to(self.device)
         self.global_visited = self.global_full_map[0,0].cpu().numpy()
         self.global_collision_map = self.global_full_map[0,0].cpu().numpy()
-        self.global_fbe_free_map = copy.deepcopy(self.global_full_map).to(self.device) # 0 is unknown, 1 is free
+
+        # self.global_fbe_free_map = copy.deepcopy(self.global_full_map).to(self.device) # 0 is unknown, 1 is free
+        self.global_fbe_free_map = self.global_full_map.clone().to(self.device)  # Changed from copy.deepcopy
         self.global_origins = np.zeros((2))
         
     # Added and used global version    
@@ -931,7 +939,9 @@ class SG_Nav_Agent():
         self.room_map = torch.zeros(1,9 ,full_w, full_h).float().to(self.device)
         self.visited = self.full_map[0,0].cpu().numpy()
         self.collision_map = self.full_map[0,0].cpu().numpy()
-        self.fbe_free_map = copy.deepcopy(self.full_map).to(self.device) # 0 is unknown, 1 is free
+
+        self.fbe_free_map = self.full_map.clone().to(self.device)  # Changed from copy.deepcopy
+        # self.fbe_free_map = copy.deepcopy(self.full_map).to(self.device) # 0 is unknown, 1 is free
         self.full_pose = torch.zeros(3).float().to(self.device)
         self.goal_gps_map = self.full_map[0,0].cpu().numpy()
         self.origins = np.zeros((2))
@@ -943,31 +953,38 @@ class SG_Nav_Agent():
 
         init_map_and_pose()
 
+    def _update_pose_once(self, observations):
+        """Update pose once and reuse across all map modules"""
+        # Convert once
+        gps_tensor = torch.from_numpy(observations['gps']).to(self.device)
+        compass_tensor = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device)
+        
+        # Update pose
+        self.full_pose[0] = self.map_size_cm / 100.0 / 2.0 + gps_tensor[0]
+        self.full_pose[1] = self.map_size_cm / 100.0 / 2.0 - gps_tensor[1]
+        self.full_pose[2:] = compass_tensor
+        
+        # Clean up intermediate tensors
+        del gps_tensor, compass_tensor
+        return self.full_pose
+
     def update_global_map(self, observations):
-        self.full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
-        self.full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
-        self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
-        self.global_full_map = self.global_sem_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.global_full_map)
+        pose = self._update_pose_once(observations)
+        self.global_full_map = self.global_sem_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), pose, self.global_full_map)
 
     # Added and used global version
     def update_map(self, observations):
-        self.full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
-        self.full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
-        self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
-        self.full_map = self.sem_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.full_map)
+        pose = self._update_pose_once(observations)
+        self.full_map = self.sem_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), pose, self.full_map)
     
     def update_free_map(self, observations):
-        self.full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
-        self.full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
-        self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
-        self.fbe_free_map = self.free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.fbe_free_map)
+        pose = self._update_pose_once(observations)
+        self.fbe_free_map = self.free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), pose, self.fbe_free_map)
         self.fbe_free_map[int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4, int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4] = 1
     
     def update_global_free_map(self, observations):
-        self.full_pose[0] = self.map_size_cm / 100.0 / 2.0+torch.from_numpy(observations['gps']).to(self.device)[0]
-        self.full_pose[1] = self.map_size_cm / 100.0 / 2.0-torch.from_numpy(observations['gps']).to(self.device)[1]
-        self.full_pose[2:] = torch.from_numpy(observations['compass'] * 57.29577951308232).to(self.device) # input degrees and meters
-        self.global_fbe_free_map = self.global_free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.global_fbe_free_map)
+        pose = self._update_pose_once(observations)
+        self.global_fbe_free_map = self.global_free_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), pose, self.global_fbe_free_map)
         self.global_fbe_free_map[int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4, int(self.map_size_cm / 10) - 3:int(self.map_size_cm / 10) + 4] = 1 
 
     # Added and used global version
@@ -1173,16 +1190,23 @@ class SG_Nav_Agent():
 
     def visualize(self, traversible, observations, number_action):
         if self.args.visualize:
-            save_map = copy.deepcopy(torch.from_numpy(traversible))
+            # save_map = copy.deepcopy(torch.from_numpy(traversible))
+            save_map = torch.from_numpy(traversible).clone()  # Changed from copy.deepcopy
             gray_map = torch.stack((save_map, save_map, save_map))
-            paper_obstacle_map = copy.deepcopy(gray_map)[:,1:-1,1:-1]
+
+            # paper_obstacle_map = copy.deepcopy(gray_map)[:,1:-1,1:-1]
+            paper_obstacle_map = gray_map[:, 1:-1, 1:-1]  # Direct slicing, no deepcopy
             paper_map = torch.zeros_like(paper_obstacle_map)
             paper_map_trans = paper_map.permute(1,2,0)
             unknown_rgb = colors.to_rgb('#FFFFFF')
             paper_map_trans[:,:,:] = torch.tensor( unknown_rgb)
             free_rgb = colors.to_rgb('#E7E7E7')
+
             # paper_map_trans[self.fbe_free_map.cpu().numpy()[0,0,::-1]>0.5,:] = torch.tensor( free_rgb).double()
-            paper_map_trans[self.global_fbe_free_map.cpu().numpy()[0,0,::-1]>0.5,:] = torch.tensor( free_rgb).double()
+            global_fbe_map_np = self.global_fbe_free_map.cpu().numpy()[0, 0, ::-1]
+            paper_map_trans[global_fbe_map_np > 0.5, :] = torch.tensor(free_rgb).double()
+
+            # paper_map_trans[global_fbe_map_np>0.5,:] = torch.tensor( free_rgb).double()
             obstacle_rgb = colors.to_rgb('#A2A2A2')
             paper_map_trans[skimage.morphology.binary_dilation(self.full_map.cpu().numpy()[0,0,::-1]>0.5,skimage.morphology.disk(1)),:] = torch.tensor(obstacle_rgb).double()
             paper_map_trans = paper_map_trans.permute(2,0,1)
@@ -1215,6 +1239,10 @@ class SG_Nav_Agent():
             visualize_image = visualize_image[:, :, ::-1]
             self.visualize_image_list.append(visualize_image)
 
+            # Clean up GPU tensors
+            del save_map, gray_map, paper_obstacle_map, paper_map, paper_map_trans
+            torch.cuda.empty_cache()
+
     def save_video(self):
         save_video_dir = os.path.join(self.visualization_dir, 'video')
         save_video_path = f'{save_video_dir}/vid_exploration_{self.count_episodes:06d}.mp4'
@@ -1234,7 +1262,7 @@ class SG_Nav_Agent():
             return
         
         save_video_dir = os.path.join(self.visualization_dir, 'video')
-        save_video_path = f'{save_video_dir}/vid_{obj_name}_episode_incremental_goal_{self.target_object_idx:06d}.mp4'
+        save_video_path = f'{save_video_dir}/vid_{obj_name}_episode_new_incremental_goal_{self.target_object_idx:06d}.mp4'
         
         if not os.path.exists(save_video_dir):
             os.makedirs(save_video_dir)
