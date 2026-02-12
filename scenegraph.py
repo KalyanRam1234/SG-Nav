@@ -395,6 +395,12 @@ Object pair(s):
                 multimask_output = False,
             )
             mask, xyxy, conf = mask.squeeze(1).cpu().numpy(), boxes_filt.squeeze(1).numpy(), conf.squeeze(1).cpu().numpy()
+
+            # IMPORTANT: Clear SAM predictor cache to free GPU memory
+            print("Clearing SAM predictor cache to free GPU memory...")
+            sam_predictor.reset_image()
+            torch.cuda.empty_cache()
+        
             return mask, xyxy, conf, caption
         else:
             raise NotImplementedError
@@ -756,6 +762,9 @@ Object pair(s):
             self.update_node()
             self.update_edge()
     
+        # Clear GPU cache after scenegraph update
+        torch.cuda.empty_cache()
+
     def get_llm_response(self, prompt):
         response = ollama.chat(
             model=self.llm_name,
