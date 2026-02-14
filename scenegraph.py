@@ -601,6 +601,9 @@ Object pair(s):
         # self.objects = merge_detections_to_objects(self.cfg, fg_detection_list, self.objects, agg_sim)
         self.objects = merge_detections_to_objects(self.cfg, fg_detection_list, self.objects, spatial_sim)
         self.objects_post = filter_objects(self.cfg, self.objects)
+
+        # Clean up intermediate tensors
+        del spatial_sim, fg_detection_list, bg_detection_list
             
     def get_caption(self):
         if self.sam_variant == 'groundedsam':
@@ -753,15 +756,36 @@ Object pair(s):
         self.mid_term_goal = sorted_group_nodes[-1].center
         return self.mid_term_goal
     
+    def _compact_old_segment2d_results(self, keep_recent=5):
+        """Strip heavy data (masks, image_rgb) from old segment2d entries to free memory.
+        Keeps 'caption' intact since get_caption() references it by absolute index."""
+        if len(self.segment2d_results) <= keep_recent:
+            return
+        for i in range(len(self.segment2d_results) - keep_recent):
+            entry = self.segment2d_results[i]
+            if entry is None:
+                continue
+            if 'mask' in entry and entry['mask'] is not None:
+                entry['mask'] = None
+            if 'image_rgb' in entry and entry['image_rgb'] is not None:
+                entry['image_rgb'] = None
+            if 'xyxy' in entry and entry['xyxy'] is not None:
+                entry['xyxy'] = None
+            if 'confidence' in entry and entry['confidence'] is not None:
+                entry['confidence'] = None
+
     def update_scenegraph(self):
         print(f'Navigate Step: {self.navigate_steps}', end='\r')
-        self.segment2d()
-        if len(self.segment2d_results) > 0:
-            self.mapping3d()
-            self.get_caption()
-            self.update_node()
-            self.update_edge()
+        with torch.no_grad():
+            self.segment2d()
+            if len(self.segment2d_results) > 0:
+                self.mapping3d()
+                self.get_caption()
+                self.update_node()
+                self.update_edge()
     
+        # Strip heavy data from old segment2d entries
+        self._compact_old_segment2d_results()
         # Clear GPU cache after scenegraph update
         torch.cuda.empty_cache()
 
@@ -806,14 +830,22 @@ Object pair(s):
         if len(image_idx) == 0:
             return None
         conf_max = -np.inf
+        idx_max = None
         # get joint images of the two nodes
         for idx in image_idx:
+            # Skip compacted entries whose image_rgb has been freed
+            if idx >= len(self.segment2d_results) or self.segment2d_results[idx] is None:
+                continue
+            if self.segment2d_results[idx].get("image_rgb") is None:
+                continue
             conf1 = node1.object["conf"][image_idx1.index(idx)]
             conf2 = node2.object["conf"][image_idx2.index(idx)]
             conf = conf1 + conf2
             if conf > conf_max:
                 conf_max = conf
                 idx_max = idx
+        if idx_max is None:
+            return None
         image = self.segment2d_results[idx_max]["image_rgb"]
         image = Image.fromarray(image)
         return image
@@ -886,7 +918,8 @@ Object pair(s):
             self.agent.detect_objects(self.observations)
             if self.agent.total_steps % 2 == 0:
                 room_detection_result = self.agent.glip_demo.inference(self.observations["rgb"][:,:,[2,1,0]], self.agent.rooms_captions)
-                self.agent.update_room_map(self.observations, room_detection_result)
+                with torch.no_grad():
+                    self.agent.update_room_map(self.observations, room_detection_result)
 
     def graph_corr(self, goal, graph):
         prompt = self.prompt_graph_corr_0.format(graph.center_node.caption, goal)
@@ -899,3 +932,177 @@ Object pair(s):
         response_3 = self.get_llm_response(prompt=prompt)
         corr_score = text2value(response_3)
         return corr_score
+
+    def _serialize_object_dict(self, obj):
+        """Convert a single detected_object dict to a serializable form."""
+        s = {}
+        for k, v in obj.items():
+            if k == 'pcd':
+                s['pcd_points'] = np.asarray(v.points)
+                s['pcd_colors'] = np.asarray(v.colors)
+            elif k == 'bbox':
+                s['bbox_points'] = np.asarray(v.get_box_points())
+                s['bbox_color'] = list(v.color)
+            elif k == 'node':
+                continue  # skip circular back-reference
+            elif k == 'mask':
+                # store masks as compressed booleans
+                s['mask'] = [m.astype(bool) if isinstance(m, np.ndarray) else m for m in v]
+            elif isinstance(v, np.ndarray):
+                s[k] = v.tolist()
+            elif isinstance(v, (torch.Tensor,)):
+                s[k] = v.cpu().numpy().tolist()
+            else:
+                s[k] = v
+        return s
+
+    @staticmethod
+    def _deserialize_object_dict(s):
+        """Reconstruct a detected_object dict from serialized form."""
+        import open3d as o3d
+        obj = {}
+        for k, v in s.items():
+            if k in ('pcd_points', 'pcd_colors', 'bbox_points', 'bbox_color'):
+                continue
+            elif k == 'mask':
+                obj['mask'] = [np.array(m, dtype=bool) if isinstance(m, list) else m for m in v]
+            elif k == 'inst_color':
+                obj[k] = np.array(v) if isinstance(v, list) else v
+            else:
+                obj[k] = v
+        # Reconstruct open3d objects
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.array(s['pcd_points']))
+        if 'pcd_colors' in s and len(s['pcd_colors']) > 0:
+            pcd.colors = o3d.utility.Vector3dVector(np.array(s['pcd_colors']))
+        obj['pcd'] = pcd
+        bbox = o3d.geometry.OrientedBoundingBox.create_from_points(
+            o3d.utility.Vector3dVector(np.array(s['bbox_points'])))
+        bbox.color = s.get('bbox_color', [0, 1, 0])
+        obj['bbox'] = bbox
+        return obj
+
+    def to_serializable_dict(self):
+        """Serialize the scene graph to a plain dict suitable for pickle/json."""
+        # Build node index map
+        node_to_idx = {id(node): i for i, node in enumerate(self.nodes)}
+
+        # Serialize nodes
+        s_nodes = []
+        for node in self.nodes:
+            s_node = {
+                'caption': node.caption,
+                'center': list(node.center) if node.center is not None else None,
+                'score': node.score,
+                'distance': node.distance,
+                'exploration_level': node.exploration_level,
+                'is_goal_node': node.is_goal_node,
+                'is_new_node': node.is_new_node,
+                'reason': node.reason,
+                'room_idx': self.room_nodes.index(node.room_node) if node.room_node is not None else None,
+            }
+            if node.object is not None:
+                s_node['object'] = self._serialize_object_dict(node.object)
+            else:
+                s_node['object'] = None
+            s_nodes.append(s_node)
+
+        # Serialize edges (deduplicated)
+        seen_edges = set()
+        s_edges = []
+        for node in self.nodes:
+            for edge in node.edges:
+                eid = id(edge)
+                if eid in seen_edges:
+                    continue
+                seen_edges.add(eid)
+                idx1 = node_to_idx.get(id(edge.node1))
+                idx2 = node_to_idx.get(id(edge.node2))
+                if idx1 is not None and idx2 is not None:
+                    s_edges.append({
+                        'node1_idx': idx1,
+                        'node2_idx': idx2,
+                        'relation': edge.relation,
+                    })
+
+        # Serialize room nodes
+        s_rooms = []
+        for rn in self.room_nodes:
+            s_rooms.append({
+                'caption': rn.caption,
+                'exploration_level': rn.exploration_level,
+            })
+
+        # Serialize objects_post
+        s_objects_post = []
+        for obj in self.objects_post:
+            s_objects_post.append(self._serialize_object_dict(obj))
+
+        return {
+            'nodes': s_nodes,
+            'edges': s_edges,
+            'room_nodes': s_rooms,
+            'objects_post': s_objects_post,
+            'visited': self.visited.copy(),
+            'num_of_goal': self.num_of_goal.cpu().numpy(),
+            'edge_text': self.edge_text,
+        }
+
+    def from_serializable_dict(self, data):
+        """Restore scene graph state from a serialized dict. 
+        Assumes self is already initialized (models, cfg, etc.)."""
+        # Restore room nodes
+        self.init_room_nodes()
+        for i, sr in enumerate(data['room_nodes']):
+            self.room_nodes[i].exploration_level = sr['exploration_level']
+
+        # Restore nodes
+        self.nodes = []
+        for s_node in data['nodes']:
+            node = ObjectNode()
+            node.caption = s_node['caption']
+            node.center = s_node['center']
+            node.score = s_node['score']
+            node.distance = s_node['distance']
+            node.exploration_level = s_node['exploration_level']
+            node.is_goal_node = s_node['is_goal_node']
+            node.is_new_node = s_node['is_new_node']
+            node.reason = s_node['reason']
+            if s_node['room_idx'] is not None:
+                node.room_node = self.room_nodes[s_node['room_idx']]
+                self.room_nodes[s_node['room_idx']].nodes.add(node)
+            if s_node['object'] is not None:
+                obj = self._deserialize_object_dict(s_node['object'])
+                obj['node'] = node  # restore back-reference
+                node.object = obj
+            self.nodes.append(node)
+
+        # Restore edges
+        self.edge_list = []
+        for s_edge in data['edges']:
+            n1 = self.nodes[s_edge['node1_idx']]
+            n2 = self.nodes[s_edge['node2_idx']]
+            edge = Edge(n1, n2)  # auto-adds to both nodes
+            edge.set_relation(s_edge['relation'])
+            self.edge_list.append(edge)
+
+        # Restore objects_post
+        self.objects_post = MapObjectList(device=self.device)
+        for s_obj in data['objects_post']:
+            obj = self._deserialize_object_dict(s_obj)
+            # Link back to node if applicable
+            for node in self.nodes:
+                if node.object is not None and node.object.get('class_name') == obj.get('class_name'):
+                    if node.center == obj.get('center', None):
+                        obj['node'] = node
+                        break
+            self.objects_post.append(obj)
+
+        # Restore visited and num_of_goal
+        self.visited = data['visited'].copy()
+        self.num_of_goal = torch.from_numpy(data['num_of_goal']).int()
+        self.edge_text = data.get('edge_text', '')
+        self.reason_visualization = ''
+        self.group_nodes = []
+        self.segment2d_results = []
+        self.objects = MapObjectList(device=self.device)

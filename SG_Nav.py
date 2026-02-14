@@ -2,6 +2,8 @@ import argparse
 import copy
 import math
 import os
+from collections import deque
+from datetime import datetime
 from matplotlib import colors
 import cv2
 import numpy as np
@@ -349,7 +351,6 @@ class SG_Nav_Agent():
         
         shortest_distance = 120
         shortest_distance_angle = 0
-        goal_prediction = copy.deepcopy(self.current_obj_predictions)
         obj_labels = self.current_obj_predictions.get_field("labels")
         goal_bbox = []
         for j, label in enumerate(obj_labels):
@@ -439,8 +440,8 @@ class SG_Nav_Agent():
             # This is to handle detection of larger objects
             if len(goal_bbox) > 0:
                 possible_goal_detected_before = copy.deepcopy(self.found_possible_goal)
-                goal_prediction.bbox = torch.stack(goal_bbox)
-                for box in goal_prediction.bbox:
+                stacked_goal_bbox = torch.stack(goal_bbox)
+                for box in stacked_goal_bbox:
                     box = box.to(torch.int64)
                     center_point = (box[:2] + box[2:]) // 2
                     temp_direction = (center_point[0] - 320) * 79 / 640
@@ -532,6 +533,7 @@ class SG_Nav_Agent():
                 if self.args.visualize:
                     print(f"[Act] Saving video for object: {self.obj_goal}")
                     self.save_video_for_object(self.obj_goal)
+                self.save_global_scenegraph(tag=f"goal_{self.obj_goal}")
                 self.reset_local_scenegraph()
             else:
                 # All objects found
@@ -539,6 +541,7 @@ class SG_Nav_Agent():
                 # Save final video for last object
                 if self.args.visualize:
                     self.save_video()
+                self.save_global_scenegraph(tag="episode_complete")
                 return {"action": 0}
         
         self.total_steps += 1
@@ -552,6 +555,7 @@ class SG_Nav_Agent():
             # All objects found, episode complete
             print(f"[Act] All target objects found! Episode complete.")
             self.save_video()
+            self.save_global_scenegraph(tag="episode_complete")
             return {"action": 0}
         print(f"[Act] Current target object: {current_target}")
         
@@ -593,12 +597,14 @@ class SG_Nav_Agent():
 
         # Need Global ones too, done
         print(f"[Act] Updating local maps...")
-        self.update_map(observations)
-        self.update_free_map(observations)
+        with torch.no_grad():
+            self.update_map(observations)
+            self.update_free_map(observations)
         
         print(f"[Act] Updating global maps...")
-        self.update_global_free_map(observations)
-        self.update_global_map(observations)
+        with torch.no_grad():
+            self.update_global_free_map(observations)
+            self.update_global_map(observations)
         
         print(f"[Act] Maps updated successfully")
 
@@ -650,12 +656,13 @@ class SG_Nav_Agent():
             self.detect_objects(observations)
             print(f"[Act] Detecting room layout...")
             room_detection_result = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], rooms_captions)
-            self.update_room_map(observations, room_detection_result)
-            print(f"[Act] Updating LOCAL room map")
+            with torch.no_grad():
+                self.update_room_map(observations, room_detection_result)
+                print(f"[Act] Updating LOCAL room map")
 
-            # adding global scene graph room information
-            print(f"[Act] Updating GLOBAL room map")
-            self.update_global_room_map(observations, room_detection_result)
+                # adding global scene graph room information
+                print(f"[Act] Updating GLOBAL room map")
+                self.update_global_room_map(observations, room_detection_result)
 
             if not self.found_goal: # if found a goal, directly go to it
                 print(f"[Act] Goal not found yet, continuing panoramic rotation")
@@ -703,6 +710,7 @@ class SG_Nav_Agent():
                 if self.args.visualize:
                     print(f"[Act] Saving video for object: {self.obj_goal}")
                     self.save_video_for_object(self.obj_goal)
+                self.save_global_scenegraph(tag=f"goal_{self.obj_goal}")
                 self.reset_local_scenegraph()
             else:
                 # All objects found
@@ -710,6 +718,7 @@ class SG_Nav_Agent():
                 # Save final video for last object
                 if self.args.visualize:
                     self.save_video()
+                self.save_global_scenegraph(tag="episode_complete")
                 return {"action": 0}
             
             self.not_use_random_goal()
@@ -882,7 +891,7 @@ class SG_Nav_Agent():
 
         observations["pointgoal_with_gps_compass"] = self.get_relative_goal_gps(observations)
 
-        self.last_loc = copy.deepcopy(self.full_pose)
+        self.last_loc = self.full_pose.clone().detach()
         self.prev_action = number_action
         self.navigate_steps += 1
         
@@ -918,8 +927,8 @@ class SG_Nav_Agent():
         fbe_map[self.fbe_free_map[0,0]>0] = 1 # first free 
         fbe_map[skimage.morphology.binary_dilation(self.full_map[0,0].cpu().numpy(), skimage.morphology.disk(4))] = 3 # then dialte obstacle
 
-        fbe_cp = copy.deepcopy(fbe_map)
-        fbe_cpp = copy.deepcopy(fbe_map)
+        fbe_cp = fbe_map.clone()
+        fbe_cpp = fbe_map.clone()
         fbe_cp[fbe_cp==0] = 4 # don't know space is 4
         fbe_cp[fbe_cp<4] = 0 # free and obstacle
         selem = skimage.morphology.disk(1)
@@ -927,8 +936,9 @@ class SG_Nav_Agent():
         
         diff = fbe_map - fbe_cpp # intersection between unknown area and free area 
         frontier_map = diff == 1
-        frontier_locations = torch.stack([torch.where(frontier_map)[0], torch.where(frontier_map)[1]]).T
-        num_frontiers = len(torch.where(frontier_map)[0])
+        frontier_indices = torch.where(frontier_map)
+        frontier_locations = torch.stack([frontier_indices[0], frontier_indices[1]]).T
+        num_frontiers = len(frontier_indices[0])
         if num_frontiers == 0:
             return None
         
@@ -960,7 +970,7 @@ class SG_Nav_Agent():
         self.scores = scores
 
         # Clean up GPU tensors
-        del fbe_map, fbe_cp, fbe_cpp
+        del fbe_map, fbe_cp, fbe_cpp, diff, frontier_map
 
         return goal
         
@@ -1201,7 +1211,7 @@ class SG_Nav_Agent():
             return new_mat
         
         goal = add_boundary(goal, value=0)
-        original_goal = copy.deepcopy(goal)
+        original_goal = goal.copy()
         
         centers = []
         if len(np.where(goal !=0)[0]) > 1:
@@ -1252,6 +1262,77 @@ class SG_Nav_Agent():
         if self.args.visualize:
             if self.simulator._env.episode_over or self.total_steps == 500:
                 self.save_video()
+                self.save_global_scenegraph(tag="episode_end")
+
+    def save_global_scenegraph(self, save_dir=None, tag=None):
+        """Save the global scene graph and global maps to disk.
+        
+        Args:
+            save_dir: Directory to save to. Defaults to data/scenegraph_saves/<experiment_name>/
+            tag: Optional tag for the filename. Defaults to timestamp.
+        """
+        import pickle
+        if save_dir is None:
+            save_dir = os.path.join('data', 'scenegraph_saves', self.experiment_name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        if tag is None:
+            tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Serialize the scene graph
+        sg_data = self.global_scenegraph.to_serializable_dict()
+
+        # Collect global maps
+        maps_data = {
+            'global_full_map': self.global_full_map.cpu().numpy(),
+            'global_room_map': self.global_room_map.cpu().numpy(),
+            'global_fbe_free_map': self.global_fbe_free_map.cpu().numpy(),
+            'global_visited': self.global_visited.copy(),
+            'global_collision_map': self.global_collision_map.copy(),
+            'global_origins': self.global_origins.copy(),
+        }
+
+        save_data = {
+            'scenegraph': sg_data,
+            'maps': maps_data,
+            'episode': getattr(self, 'episode_n', None),
+            'target_object_idx': self.target_object_idx,
+            'found_objects': self.found_objects,
+            'total_steps': self.total_steps,
+        }
+
+        filepath = os.path.join(save_dir, f'global_sg_{tag}.pkl')
+        with open(filepath, 'wb') as f:
+            pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f'Global scene graph saved to {filepath}')
+        return filepath
+
+    def load_global_scenegraph(self, filepath):
+        """Load a previously saved global scene graph and global maps.
+        
+        Args:
+            filepath: Path to the .pkl file saved by save_global_scenegraph().
+        """
+        import pickle
+        with open(filepath, 'rb') as f:
+            save_data = pickle.load(f)
+
+        # Restore scene graph
+        self.global_scenegraph.from_serializable_dict(save_data['scenegraph'])
+
+        # Restore global maps
+        maps = save_data['maps']
+        self.global_full_map = torch.from_numpy(maps['global_full_map']).float().to(self.device)
+        self.global_room_map = torch.from_numpy(maps['global_room_map']).float().to(self.device)
+        self.global_fbe_free_map = torch.from_numpy(maps['global_fbe_free_map']).float().to(self.device)
+        self.global_visited = maps['global_visited'].copy()
+        self.global_collision_map = maps['global_collision_map'].copy()
+        self.global_origins = maps['global_origins'].copy()
+
+        # Restore metadata
+        self.target_object_idx = save_data.get('target_object_idx', 0)
+        self.found_objects = save_data.get('found_objects', {})
+        print(f'Global scene graph loaded from {filepath}')
 
     def visualize(self, traversible, observations, number_action):
         if self.args.visualize:
@@ -1309,25 +1390,36 @@ class SG_Nav_Agent():
             torch.cuda.empty_cache()
 
     def save_video(self):
+        if len(self.visualize_image_list) == 0:
+            print(f"[Save Video] No visualizations to save")
+            return
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         save_video_dir = os.path.join(self.visualization_dir, 'video')
-        save_video_path = f'{save_video_dir}/vid_exploration_{self.count_episodes:06d}.mp4'
+        save_video_path = f'{save_video_dir}/vid_{timestamp}_ep{self.count_episodes:04d}_idx{self.target_object_idx:02d}.mp4'
         if not os.path.exists(save_video_dir):
             os.makedirs(save_video_dir)
-        height, width, layers = self.visualize_image_list[0].shape
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video = cv2.VideoWriter(save_video_path, fourcc, 4.0, (width, height))
-        for visualize_image in self.visualize_image_list:  
-            video.write(visualize_image)
-        video.release()
+        try:
+            height, width, layers = self.visualize_image_list[0].shape
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video = cv2.VideoWriter(save_video_path, fourcc, 4.0, (width, height))
+            for visualize_image in self.visualize_image_list:  
+                video.write(visualize_image)
+            video.release()
+            print(f"[Save Video] Saved {len(self.visualize_image_list)} frames to {save_video_path}")
+        except Exception as e:
+            print(f"[Save Video] Error: {e}")
+        # Free visualization frames from memory
+        self.visualize_image_list.clear()
     
     def save_video_for_object(self, obj_name):
-        """Save video for a specific object that was just found"""
+        """Save video for a specific object search, then clear frames for the next goal."""
         if len(self.visualize_image_list) == 0:
             print(f"[Save Video] No visualizations to save for object: {obj_name}")
             return
         
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         save_video_dir = os.path.join(self.visualization_dir, 'video')
-        save_video_path = f'{save_video_dir}/vid_4_{obj_name}_episode_new_incremental_goal_{self.target_object_idx:06d}.mp4'
+        save_video_path = f'{save_video_dir}/vid_{timestamp}_ep{self.count_episodes:04d}_idx{self.target_object_idx:02d}_{obj_name}.mp4'
         
         if not os.path.exists(save_video_dir):
             os.makedirs(save_video_dir)
@@ -1339,9 +1431,11 @@ class SG_Nav_Agent():
             for visualize_image in self.visualize_image_list:  
                 video.write(visualize_image)
             video.release()
-            print(f"[Save Video] Saved video for object '{obj_name}' with {len(self.visualize_image_list)} frames to {save_video_path}")
+            print(f"[Save Video] Saved video for '{obj_name}' ({len(self.visualize_image_list)} frames) to {save_video_path}")
         except Exception as e:
-            print(f"[Save Video] Error saving video for object '{obj_name}': {e}")
+            print(f"[Save Video] Error saving video for '{obj_name}': {e}")
+        # Free visualization frames — next goal starts a fresh video
+        self.visualize_image_list.clear()
 
     def visualize_agent_and_goal(self, map):
         for idx, pose in enumerate(self.history_pose):
