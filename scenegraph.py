@@ -169,11 +169,16 @@ class SceneGraph():
         self.sam_checkpoint = 'data/models/sam_vit_h_4b8939.pth'
         self.segment2d_results = []
         self.max_detections_per_object = 10
-        self.threshold_list = {'bathtub': 2, 'bed': 7, 'cabinet': 3, 'chair': 5, 'chest_of_drawers': 5, 'clothes': 9, 'counter': 4, 'cushion': 7, 'fireplace': 4, 'gym_equipment': 7, 'picture': 9, 'plant': 3, 'seating': 2, 'shower': 2, 'sink': 3, 'sofa': 9, 'stool': 5, 'table': 8, 'toilet': 3, 'towel': 4, 'tv_monitor': 2, 'treadmill. fitness equipment.': 0}
-        self.small_objects = ['bathtub', 'chest_of_drawers', 'cushion', 'plant', 'seating', 'shower', 'toilet', 'tv_monitor']
+        
+        self.threshold_list = {'bathtub': 2, 'bed': 7, 'cabinet': 3, 'chair': 5, 'chest_of_drawers': 5, 'clothes': 9, 'counter': 4, 'cushion': 7, 'fireplace': 4, 'gym_equipment': 7, 'picture': 9, 'plant': 3, 'seating': 2, 'shower': 2, 'sink': 3, 'sofa': 9, 'stool': 5, 'table': 8, 'toilet': 3, 'towel': 4, 'tv_monitor': 2, 'treadmill. fitness equipment.': 0,
+            'lamp': 3, 'mirror': 3, 'rug': 4, 'curtain': 4, 'shelf': 3, 'desk': 5, 'door': 3, 'window': 3, 'pillow': 4, 'blanket': 4}
+        self.small_objects = ['bathtub', 'chest_of_drawers', 'cushion', 'plant', 'seating', 'shower', 'toilet', 'tv_monitor',
+            'lamp', 'mirror', 'pillow', 'blanket']
         self.found_goal_times_threshold = 1
         self.N_max = 10
-        self.node_space = 'bathtub. bed. cabinet. chair. drawers. clothes. counter. cushion. fireplace. gym. picture. plant. seating. shower. sink. sofa. stool. table. toilet. towel. tv. treadmill. fitness equipment.'
+        self.object_vocabulary = self._load_object_vocabulary('tools/object_vocabulary.txt')
+        self.node_space = '. '.join(self.object_vocabulary) + '.'
+        print(f"[SceneGraph] Loaded {len(self.object_vocabulary)} objects for detection: {self.node_space}")
         self.prompt_edge_proposal = '''
 Provide the most possible single spatial relationship for each of the following object pairs. Answer with only one relationship per pair, and separate each answer with a newline character. Do not response superfluous text.
 Example 1:
@@ -205,6 +210,23 @@ Object pair(s):
         self.mask_generator = self.get_sam_mask_generator(self.sam_variant, self.device)
         self.set_cfg()
         self.set_agent(agent)
+
+    def _load_object_vocabulary(self, filepath):
+        """Load object vocabulary from file for GroundingDINO prompt"""
+        objects = []
+        try:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        objects.append(line)
+        except FileNotFoundError:
+            print(f"[SceneGraph] WARNING: {filepath} not found, using default vocabulary")
+            objects = ['bathtub', 'bed', 'cabinet', 'chair', 'drawers', 'clothes', 'counter',
+                       'cushion', 'fireplace', 'gym', 'picture', 'plant', 'seating', 'shower',
+                       'sink', 'sofa', 'stool', 'table', 'toilet', 'towel', 'tv', 'treadmill',
+                       'fitness equipment']
+        return objects
 
     def reset(self):
         full_w, full_h = self.map_size, self.map_size

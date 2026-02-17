@@ -162,6 +162,7 @@ class SG_Nav_Agent():
 
         self.target_object_idx = 0
         self.found_objects = {}  # Track which objects have been found
+        self.detected_objects_extended = set()  # Track extended category detections
         
         # This is to adjust the experiment
         self.experiment_name = 'experiment_0'
@@ -273,6 +274,7 @@ class SG_Nav_Agent():
         self.explanation = ''
         self.text_node = ''
         self.text_edge = ''
+        self.detected_objects_extended = set()
 
         self.scenegraph.reset()
         
@@ -360,7 +362,7 @@ class SG_Nav_Agent():
                 goal_bbox.append(self.current_obj_predictions.bbox[j])
         
         for j, label in enumerate(obj_labels):
-            # only adding objects which are in the original 21 categories
+            # Track objects in original 21 categories for navigation scoring
             if label in categories_21_origin:
                 confidence = self.current_obj_predictions.get_field("scores")[j]
                 bbox = self.current_obj_predictions.bbox[j].to(torch.int64)
@@ -376,6 +378,10 @@ class SG_Nav_Agent():
                 x = int(self.map_size_cm/10-obj_gps[1]*100/self.resolution)
                 y = int(self.map_size_cm/10+obj_gps[0]*100/self.resolution)
                 self.obj_locations[categories_21_origin.index(label)].append([confidence, x, y])
+            elif label in categories_extended:
+                # Track extended category detections for richer scene graph
+                confidence = self.current_obj_predictions.get_field("scores")[j]
+                self.detected_objects_extended.add(label)
         
         # it is to be noted that the scenegraph.obj_goal is what will change,  this is for smaller object detection
         if self.scenegraph.obj_goal in self.scenegraph.small_objects:
@@ -518,9 +524,24 @@ class SG_Nav_Agent():
               f"Nodes: {metrics['num_nodes']:3d} | "
               f"Edges: {metrics['num_edges']:3d} | "
               f"Target: {self.obj_goal}")
+        
+        # Log unique objects detected in scene graphs
+        local_objects = set(node.caption for node in self.scenegraph.nodes)
+        global_objects = set(node.caption for node in self.global_scenegraph.nodes)
+        all_detected = local_objects | global_objects | self.detected_objects_extended
+        print(f"[Objects] Local SG unique: {sorted(local_objects)} ({len(local_objects)})")
+        print(f"[Objects] Global SG unique: {sorted(global_objects)} ({len(global_objects)})")
+        if self.detected_objects_extended:
+            print(f"[Objects] Extended detections: {sorted(self.detected_objects_extended)} ({len(self.detected_objects_extended)})")
+        print(f"[Objects] Total unique objects detected: {sorted(all_detected)} ({len(all_detected)})")
 
     # Observations are the sensor informations       
     def act(self, observations):
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+            print(f"[GPU] Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB | Total: {total:.2f} GB | Step: {self.total_steps}")
         if self.total_steps >= 500:
             print(f"[Act] Max steps reached: {self.total_steps}")
             self.found_objects[self.obj_goal] = False
