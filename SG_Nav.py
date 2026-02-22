@@ -164,6 +164,14 @@ class SG_Nav_Agent():
         self.found_objects = {}  # Track which objects have been found
         self.detected_objects_extended = set()  # Track extended category detections
         
+        # LLM escape mode state
+        self.escape_action_queue = []
+        self.executing_escape = False
+        self.escape_attempts = 0
+        self.max_escape_attempts = 2
+        self.max_escape_actions = 15
+        self.action_history = []
+
         # This is to adjust the experiment
         self.experiment_name = 'experiment_0'
 
@@ -275,6 +283,10 @@ class SG_Nav_Agent():
         self.text_node = ''
         self.text_edge = ''
         self.detected_objects_extended = set()
+        self.escape_action_queue = []
+        self.executing_escape = False
+        self.escape_attempts = 0
+        self.action_history = []
 
         self.scenegraph.reset()
         
@@ -338,6 +350,9 @@ class SG_Nav_Agent():
         self.explanation = ''
         self.text_node = ''
         self.text_edge = ''
+        self.escape_action_queue = []
+        self.executing_escape = False
+        self.escape_attempts = 0
         
         # IMPORTANT: Reset the local scene graph nodes and edges (but NOT global)
         print(f"[Reset] Resetting LOCAL scene graph (nodes and edges)")
@@ -535,13 +550,182 @@ class SG_Nav_Agent():
             print(f"[Objects] Extended detections: {sorted(self.detected_objects_extended)} ({len(self.detected_objects_extended)})")
         print(f"[Objects] Total unique objects detected: {sorted(all_detected)} ({len(all_detected)})")
 
+    def _serialize_scene_graph_for_vlm(self):
+        """Serialize scene graph + spatial state for VLM escape prompt."""
+        lines = []
+        
+        # 1. Agent state
+        pose = self.full_pose.cpu().numpy()
+        lines.append(f"=== AGENT STATE ===")
+        lines.append(f"Position: ({pose[0]:.2f}, {pose[1]:.2f})")
+        lines.append(f"Orientation: {pose[2]:.1f} degrees")
+        lines.append(f"Target object: {self.obj_goal}")
+        lines.append(f"Steps taken: {self.total_steps}")
+        lines.append(f"Steps without moving: {self.not_move_steps}")
+        
+        # 2. Recent action history
+        action_names = {0: 'stop', 1: 'move_forward', 2: 'turn_left', 3: 'turn_right', 6: 'panoramic'}
+        recent = [action_names.get(a, str(a)) for a in self.action_history[-10:]]
+        lines.append(f"Recent actions: {', '.join(recent)}")
+        
+        # 3. Global scene graph
+        lines.append(f"\n=== SCENE GRAPH ===")
+        
+        if hasattr(self.global_scenegraph, 'room_nodes') and self.global_scenegraph.room_nodes:
+            room_names = [r.caption for r in self.global_scenegraph.room_nodes if r.nodes]
+            if room_names:
+                lines.append(f"Rooms with objects: {', '.join(room_names)}")
+        
+        global_objects = sorted(set(node.caption for node in self.global_scenegraph.nodes))
+        local_objects = sorted(set(node.caption for node in self.scenegraph.nodes))
+        lines.append(f"Objects seen globally: {', '.join(global_objects) if global_objects else 'none'}")
+        lines.append(f"Objects seen locally: {', '.join(local_objects) if local_objects else 'none'}")
+        
+        edges = self.global_scenegraph.get_edges()
+        if edges:
+            edge_texts = [f"{e.node1.caption} {e.relation} {e.node2.caption}" for e in edges[:20]]
+            lines.append(f"Spatial relationships: {'; '.join(edge_texts)}")
+        
+        # 4. Spatial map summary
+        lines.append(f"\n=== SPATIAL MAP ===")
+        lines.append(self._get_spatial_map_summary())
+        
+        return '\n'.join(lines)
+
+    def _get_spatial_map_summary(self):
+        """Summarize spatial maps for the VLM prompt."""
+        lines = []
+        
+        if hasattr(self, 'global_fbe_free_map') and self.global_fbe_free_map is not None:
+            free_map = self.global_fbe_free_map[0, 0].cpu().numpy()
+            total_cells = free_map.size
+            free_cells = (free_map > 0).sum()
+            lines.append(f"Explored area: {free_cells}/{total_cells} cells "
+                         f"({100*free_cells/total_cells:.1f}%)")
+        
+        if hasattr(self, 'global_collision_map'):
+            collision_cells = (self.global_collision_map > 0).sum()
+            lines.append(f"Collision cells: {collision_cells}")
+        
+        pose = self.full_pose.cpu().numpy()
+        agent_x = int(self.map_size_cm / 10 - pose[1] * 100 / self.resolution)
+        agent_y = int(self.map_size_cm / 10 + pose[0] * 100 / self.resolution)
+        agent_x = max(2, min(agent_x, self.map_size - 3))
+        agent_y = max(2, min(agent_y, self.map_size - 3))
+        
+        if hasattr(self, 'global_collision_map'):
+            local_collisions = self.global_collision_map[
+                agent_x-2:agent_x+3, agent_y-2:agent_y+3]
+            lines.append(f"Nearby collision pattern (5x5 grid around agent):")
+            for row in local_collisions:
+                lines.append('  ' + ' '.join(['X' if c > 0 else '.' for c in row]))
+        
+        if self.current_rooms:
+            lines.append(f"Current room(s): {', '.join(self.current_rooms)}")
+        
+        return '\n'.join(lines)
+
+    def _build_escape_prompt(self):
+        """Build the VLM prompt for escape planning."""
+        scene_context = self._serialize_scene_graph_for_vlm()
+        
+        prompt = f"""You are controlling a robot that is STUCK and cannot make progress toward its navigation goal.
+
+        {scene_context}
+
+        The robot's available actions are:
+        - move_forward: Move 0.25m in the direction the robot is facing
+        - turn_left: Rotate 30 degrees left
+        - turn_right: Rotate 30 degrees right
+
+        The attached image shows the robot's current camera view.
+
+        Based on the scene graph, spatial map, and camera view:
+        1. Analyze WHY the robot is stuck (wall, corner, obstacle, oscillating?)
+        2. Provide a sequence of actions to escape the stuck position and make progress toward finding: {self.obj_goal}
+
+        RULES:
+        - Output ONLY a comma-separated list of actions, max {self.max_escape_actions} actions
+        - Use exactly these names: move_forward, turn_left, turn_right
+        - Do NOT include any other text, explanation, or formatting
+
+        Example output:
+        turn_right, turn_right, move_forward, move_forward, turn_left, move_forward"""
+        
+        return prompt
+
+    def _parse_escape_actions(self, vlm_response):
+        """Parse VLM response into a list of integer actions."""
+        action_map = {
+            'move_forward': 1,
+            'turn_left': 2,
+            'turn_right': 3,
+        }
+        
+        actions = []
+        response_clean = vlm_response.strip().lower()
+        response_clean = response_clean.replace('`', '').replace('*', '')
+        tokens = [t.strip().strip('.') for t in response_clean.split(',')]
+        
+        for token in tokens:
+            if token in action_map:
+                actions.append(action_map[token])
+            elif 'forward' in token:
+                actions.append(1)
+            elif 'left' in token:
+                actions.append(2)
+            elif 'right' in token:
+                actions.append(3)
+        
+        actions = actions[:self.max_escape_actions]
+        return actions
+
+    def llm_plan_escape(self, observations):
+        """Use VLM to plan an escape sequence when the robot is stuck."""
+        print(f"[LLM Escape] Planning escape (attempt {self.escape_attempts + 1}/{self.max_escape_attempts})")
+        
+        prompt = self._build_escape_prompt()
+        print(f"[LLM Escape] Prompt:\n{prompt}")
+        
+        try:
+            from PIL import Image
+            rgb_image = Image.fromarray(observations["rgb"])
+            response = self.scenegraph.get_vlm_response(prompt=prompt, image=rgb_image)
+            print(f"[LLM Escape] VLM response: {response}")
+        except Exception as e:
+            print(f"[LLM Escape] VLM call failed: {e}")
+            self.escape_attempts += 1
+            return False
+        
+        if not response:
+            print(f"[LLM Escape] Empty VLM response")
+            self.escape_attempts += 1
+            return False
+        
+        actions = self._parse_escape_actions(response)
+        print(f"[LLM Escape] Parsed actions: {actions}")
+        
+        self.escape_attempts += 1
+        
+        if actions:
+            self.escape_action_queue = actions
+            self.executing_escape = True
+            print(f"[LLM Escape] Queued {len(actions)} escape actions")
+            return True
+        else:
+            print(f"[LLM Escape] Failed to parse valid actions from VLM response")
+            return False
+
     # Observations are the sensor informations       
     def act(self, observations):
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
-            total = torch.cuda.get_device_properties(0).total_mem / 1024**3
-            print(f"[GPU] Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB | Total: {total:.2f} GB | Step: {self.total_steps}")
+            free_device, total_device = torch.cuda.mem_get_info(0)
+            free_device_gb = free_device / 1024**3
+            total_device_gb = total_device / 1024**3
+            used_by_others = total_device_gb - free_device_gb - reserved
+            print(f"[GPU] Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB | Free(device): {free_device_gb:.2f} GB | Total: {total_device_gb:.2f} GB | Others: {used_by_others:.2f} GB | Step: {self.total_steps}")
         if self.total_steps >= 500:
             print(f"[Act] Max steps reached: {self.total_steps}")
             self.found_objects[self.obj_goal] = False
@@ -567,6 +751,23 @@ class SG_Nav_Agent():
         
         self.total_steps += 1
         self.exploration_total_steps +=1
+
+        # LLM escape mode: execute queued escape actions
+        if self.executing_escape and self.escape_action_queue:
+            escape_action = self.escape_action_queue.pop(0)
+            print(f"[Act] LLM ESCAPE: Executing action {escape_action} "
+                  f"({len(self.escape_action_queue)} remaining)")
+            
+            if not self.escape_action_queue:
+                print(f"[Act] LLM ESCAPE: Sequence complete, resuming normal navigation")
+                self.executing_escape = False
+            
+            self.prev_action = escape_action
+            self.action_history.append(escape_action)
+            if len(self.action_history) > 20:
+                self.action_history = self.action_history[-20:]
+            self.navigate_steps += 1
+            return {"action": escape_action}
 
         # Determine current target object
         print(f"\n{'='*100}")
@@ -856,52 +1057,91 @@ class SG_Nav_Agent():
                     self.fbe_free_map[0, 0, x_0:x_1, y_0:y_1] = 0
                     self.global_fbe_free_map[0, 0, x_0:x_1, y_0:y_1] = 0
             
-            # Try FBE first instead of random goal
-            print(f"[Act] Computing new FBE goal to escape...")
-            new_goal_loc = self.fbe(traversible, cur_start)
-            
-            if new_goal_loc is not None:
-                print(f"[Act] FBE found escape frontier at: {new_goal_loc}")
-                self.goal_map = np.zeros(self.full_map.shape[-2:])
-                self.goal_map[new_goal_loc[0], new_goal_loc[1]] = 1
-                self.goal_map = self.goal_map[::-1]
-                self.using_random_goal = False
-                self.fronter_this_ex += 1
-            else:
-                # Only use random goal as last resort
-                print(f"[Act] FBE failed, using random goal")
-                self.goal_map = self.set_random_goal()
-                self.using_random_goal = True
-                self.random_this_ex += 1
-            
-            # Recompute plan with new goal
-            stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
-            print(f"[Act] New plan: STG=({stg_y:.2f}, {stg_x:.2f}), Action={number_action}")
-            
-            # If still getting action=0, force a random movement to break the cycle
-            if number_action == 0:
-                self.loop_time += 1
-                if self.loop_time <= 3:
-                    # Try turning in alternating directions to find a way out
-                    if self.loop_time % 2 == 1:
-                        number_action = 2  # Turn left
-                        print(f"[Act] Forcing turn LEFT to break stuck cycle (attempt {self.loop_time})")
-                    else:
-                        number_action = 3  # Turn right
-                        print(f"[Act] Forcing turn RIGHT to break stuck cycle (attempt {self.loop_time})")
-                elif self.loop_time <= 6:
-                    # Try moving forward even if planner says stop
-                    number_action = 1  # Move forward
-                    print(f"[Act] Forcing FORWARD movement to break stuck cycle (attempt {self.loop_time})")
+            # === LLM ESCAPE MODE ===
+            if hasattr(self.args, 'llm_escape') and self.args.llm_escape \
+                    and self.escape_attempts < self.max_escape_attempts:
+                if self.llm_plan_escape(observations):
+                    number_action = self.escape_action_queue.pop(0)
+                    print(f"[LLM Escape] Starting escape with action: {number_action}")
                 else:
-                    # Give up after too many attempts
-                    print(f"[Act] Failed to unstuck after {self.loop_time} attempts")
-                    self.loop_time = 0
-                    # Don't return action 0, try one more forward
-                    number_action = 1
+                    print(f"[LLM Escape] VLM failed, falling back to primitive recovery")
+                    # Primitive recovery fallback
+                    print(f"[Act] Computing new FBE goal to escape...")
+                    new_goal_loc = self.fbe(traversible, cur_start)
+                    
+                    if new_goal_loc is not None:
+                        print(f"[Act] FBE found escape frontier at: {new_goal_loc}")
+                        self.goal_map = np.zeros(self.full_map.shape[-2:])
+                        self.goal_map[new_goal_loc[0], new_goal_loc[1]] = 1
+                        self.goal_map = self.goal_map[::-1]
+                        self.using_random_goal = False
+                        self.fronter_this_ex += 1
+                    else:
+                        print(f"[Act] FBE failed, using random goal")
+                        self.goal_map = self.set_random_goal()
+                        self.using_random_goal = True
+                        self.random_this_ex += 1
+                    
+                    stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
+                    print(f"[Act] New plan: STG=({stg_y:.2f}, {stg_x:.2f}), Action={number_action}")
+                    
+                    if number_action == 0:
+                        self.loop_time += 1
+                        if self.loop_time <= 3:
+                            if self.loop_time % 2 == 1:
+                                number_action = 2
+                                print(f"[Act] Forcing turn LEFT to break stuck cycle (attempt {self.loop_time})")
+                            else:
+                                number_action = 3
+                                print(f"[Act] Forcing turn RIGHT to break stuck cycle (attempt {self.loop_time})")
+                        elif self.loop_time <= 6:
+                            number_action = 1
+                            print(f"[Act] Forcing FORWARD movement to break stuck cycle (attempt {self.loop_time})")
+                        else:
+                            print(f"[Act] Failed to unstuck after {self.loop_time} attempts")
+                            self.loop_time = 0
+                            number_action = 1
+                    else:
+                        self.loop_time = 0
             else:
-                # Successfully got a non-zero action, reset loop counter
-                self.loop_time = 0
+                # Primitive recovery (existing logic)
+                print(f"[Act] Computing new FBE goal to escape...")
+                new_goal_loc = self.fbe(traversible, cur_start)
+                
+                if new_goal_loc is not None:
+                    print(f"[Act] FBE found escape frontier at: {new_goal_loc}")
+                    self.goal_map = np.zeros(self.full_map.shape[-2:])
+                    self.goal_map[new_goal_loc[0], new_goal_loc[1]] = 1
+                    self.goal_map = self.goal_map[::-1]
+                    self.using_random_goal = False
+                    self.fronter_this_ex += 1
+                else:
+                    print(f"[Act] FBE failed, using random goal")
+                    self.goal_map = self.set_random_goal()
+                    self.using_random_goal = True
+                    self.random_this_ex += 1
+                
+                stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
+                print(f"[Act] New plan: STG=({stg_y:.2f}, {stg_x:.2f}), Action={number_action}")
+                
+                if number_action == 0:
+                    self.loop_time += 1
+                    if self.loop_time <= 3:
+                        if self.loop_time % 2 == 1:
+                            number_action = 2  # Turn left
+                            print(f"[Act] Forcing turn LEFT to break stuck cycle (attempt {self.loop_time})")
+                        else:
+                            number_action = 3  # Turn right
+                            print(f"[Act] Forcing turn RIGHT to break stuck cycle (attempt {self.loop_time})")
+                    elif self.loop_time <= 6:
+                        number_action = 1  # Move forward
+                        print(f"[Act] Forcing FORWARD movement to break stuck cycle (attempt {self.loop_time})")
+                    else:
+                        print(f"[Act] Failed to unstuck after {self.loop_time} attempts")
+                        self.loop_time = 0
+                        number_action = 1
+                else:
+                    self.loop_time = 0
         else:
             self.loop_time = 0
 
@@ -914,6 +1154,9 @@ class SG_Nav_Agent():
 
         self.last_loc = self.full_pose.clone().detach()
         self.prev_action = number_action
+        self.action_history.append(number_action)
+        if len(self.action_history) > 20:
+            self.action_history = self.action_history[-20:]
         self.navigate_steps += 1
         
         # Print final metrics and statistics
@@ -1470,6 +1713,23 @@ class SG_Nav_Agent():
         return map
 
 
+def _reserve_gpu_memory(reserve_gb=25):
+    """Pre-reserve GPU memory so other processes can't claim it.
+    PyTorch's caching allocator keeps the memory even after the tensor is freed."""
+    if torch.cuda.is_available():
+        free_before, total = torch.cuda.mem_get_info(0)
+        reserve_bytes = int(reserve_gb * 1024**3)
+        reserve_bytes = min(reserve_bytes, int(free_before * 0.95))  # don't exceed 95% of free
+        print(f"[GPU Reserve] Reserving {reserve_bytes / 1024**3:.2f} GB of GPU memory "
+              f"(free: {free_before / 1024**3:.2f} GB, total: {total / 1024**3:.2f} GB)")
+        dummy = torch.empty(reserve_bytes // 4, dtype=torch.float32, device='cuda:0')
+        del dummy
+        free_after, _ = torch.cuda.mem_get_info(0)
+        print(f"[GPU Reserve] Done. Free before: {free_before / 1024**3:.2f} GB, "
+              f"Free after: {free_after / 1024**3:.2f} GB, "
+              f"Reserved by PyTorch: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1481,7 +1741,16 @@ def main():
     parser.add_argument(
         "--split_r", default=11, type=int
     )
+    parser.add_argument(
+        "--llm_escape", action='store_true',
+        help="Enable LLM-guided escape when robot is stuck"
+    )
+    parser.add_argument(
+        "--reserve_gpu_gb", default=25, type=float,
+        help="Pre-reserve GPU memory in GB to prevent other processes from claiming it"
+    )
     args = parser.parse_args()
+    _reserve_gpu_memory(args.reserve_gpu_gb)
     os.environ["CHALLENGE_CONFIG_FILE"] = "configs/challenge_objectnav2021.local.rgbd.yaml"
     config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
     config = habitat.get_config(config_paths)
