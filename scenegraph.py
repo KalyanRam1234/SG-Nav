@@ -548,10 +548,9 @@ Object pair(s):
 
     def segment2d(self):
         if self.sam_variant == 'sam' or self.sam_variant == 'groundedsam':
-            with torch.no_grad():
-                mask, xyxy, conf, caption = self.get_sam_segmentation_dense(self.sam_variant, self.mask_generator, self.image_rgb)
-                self.seg_xyxy = xyxy
-                self.seg_caption = caption
+            mask, xyxy, conf, caption = self.get_sam_segmentation_dense(self.sam_variant, self.mask_generator, self.image_rgb)
+            self.seg_xyxy = xyxy
+            self.seg_caption = caption
             if caption is None:
                 return
             detections = sv.Detections(
@@ -798,13 +797,12 @@ Object pair(s):
 
     def update_scenegraph(self):
         print(f'Navigate Step: {self.navigate_steps}', end='\r')
-        with torch.no_grad():
-            self.segment2d()
-            if len(self.segment2d_results) > 0:
-                self.mapping3d()
-                self.get_caption()
-                self.update_node()
-                self.update_edge()
+        self.segment2d()
+        if len(self.segment2d_results) > 0:
+            self.mapping3d()
+            self.get_caption()
+            self.update_node()
+            self.update_edge()
     
         # Strip heavy data from old segment2d entries
         self._compact_old_segment2d_results()
@@ -940,8 +938,7 @@ Object pair(s):
             self.agent.detect_objects(self.observations)
             if self.agent.total_steps % 2 == 0:
                 room_detection_result = self.agent.glip_demo.inference(self.observations["rgb"][:,:,[2,1,0]], self.agent.rooms_captions)
-                with torch.no_grad():
-                    self.agent.update_room_map(self.observations, room_detection_result)
+                self.agent.update_room_map(self.observations, room_detection_result)
 
     def graph_corr(self, goal, graph):
         prompt = self.prompt_graph_corr_0.format(graph.center_node.caption, goal)

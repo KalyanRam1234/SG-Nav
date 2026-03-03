@@ -721,12 +721,12 @@ class SG_Nav_Agent():
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
-            free_device, total_device = torch.cuda.mem_get_info(0)
+            free_device, total_device = _get_free_and_total_gpu_memory()
             free_device_gb = free_device / 1024**3
             total_device_gb = total_device / 1024**3
             used_by_others = total_device_gb - free_device_gb - reserved
             print(f"[GPU] Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB | Free(device): {free_device_gb:.2f} GB | Total: {total_device_gb:.2f} GB | Others: {used_by_others:.2f} GB | Step: {self.total_steps}")
-        if self.total_steps >= 500:
+        if self.total_steps >= 300:
             print(f"[Act] Max steps reached: {self.total_steps}")
             self.found_objects[self.obj_goal] = False
             self.target_object_idx += 1
@@ -819,14 +819,12 @@ class SG_Nav_Agent():
 
         # Need Global ones too, done
         print(f"[Act] Updating local maps...")
-        with torch.no_grad():
-            self.update_map(observations)
-            self.update_free_map(observations)
+        self.update_map(observations)
+        self.update_free_map(observations)
         
         print(f"[Act] Updating global maps...")
-        with torch.no_grad():
-            self.update_global_free_map(observations)
-            self.update_global_map(observations)
+        self.update_global_free_map(observations)
+        self.update_global_map(observations)
         
         print(f"[Act] Maps updated successfully")
 
@@ -878,13 +876,12 @@ class SG_Nav_Agent():
             self.detect_objects(observations)
             print(f"[Act] Detecting room layout...")
             room_detection_result = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], rooms_captions)
-            with torch.no_grad():
-                self.update_room_map(observations, room_detection_result)
-                print(f"[Act] Updating LOCAL room map")
+            self.update_room_map(observations, room_detection_result)
+            print(f"[Act] Updating LOCAL room map")
 
-                # adding global scene graph room information
-                print(f"[Act] Updating GLOBAL room map")
-                self.update_global_room_map(observations, room_detection_result)
+            # adding global scene graph room information
+            print(f"[Act] Updating GLOBAL room map")
+            self.update_global_room_map(observations, room_detection_result)
 
             if not self.found_goal: # if found a goal, directly go to it
                 print(f"[Act] Goal not found yet, continuing panoramic rotation")
@@ -1524,7 +1521,7 @@ class SG_Nav_Agent():
         self.metrics['spl'] = metrics['spl']
         self.metrics['softspl'] = metrics['softspl']
         if self.args.visualize:
-            if self.simulator._env.episode_over or self.total_steps == 500:
+            if self.simulator._env.episode_over or self.total_steps == 300:
                 self.save_video()
                 self.save_global_scenegraph(tag="episode_end")
 
@@ -1713,18 +1710,32 @@ class SG_Nav_Agent():
         return map
 
 
+def _get_free_and_total_gpu_memory():
+    """Get free and total GPU memory in bytes, compatible with older PyTorch."""
+    if hasattr(torch.cuda, 'mem_get_info'):
+        return torch.cuda.mem_get_info(0)
+    # Fallback: parse nvidia-smi output
+    import subprocess
+    result = subprocess.run(
+        ['nvidia-smi', '--query-gpu=memory.free,memory.total', '--format=csv,noheader,nounits', '-i', '0'],
+        capture_output=True, text=True
+    )
+    free_mb, total_mb = [int(x.strip()) for x in result.stdout.strip().split(',')]
+    return free_mb * 1024**2, total_mb * 1024**2
+
+
 def _reserve_gpu_memory(reserve_gb=25):
     """Pre-reserve GPU memory so other processes can't claim it.
     PyTorch's caching allocator keeps the memory even after the tensor is freed."""
     if torch.cuda.is_available():
-        free_before, total = torch.cuda.mem_get_info(0)
+        free_before, total = _get_free_and_total_gpu_memory()
         reserve_bytes = int(reserve_gb * 1024**3)
         reserve_bytes = min(reserve_bytes, int(free_before * 0.95))  # don't exceed 95% of free
         print(f"[GPU Reserve] Reserving {reserve_bytes / 1024**3:.2f} GB of GPU memory "
               f"(free: {free_before / 1024**3:.2f} GB, total: {total / 1024**3:.2f} GB)")
         dummy = torch.empty(reserve_bytes // 4, dtype=torch.float32, device='cuda:0')
         del dummy
-        free_after, _ = torch.cuda.mem_get_info(0)
+        free_after, _ = _get_free_and_total_gpu_memory()
         print(f"[GPU Reserve] Done. Free before: {free_before / 1024**3:.2f} GB, "
               f"Free after: {free_after / 1024**3:.2f} GB, "
               f"Reserved by PyTorch: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
@@ -1744,6 +1755,10 @@ def main():
     parser.add_argument(
         "--llm_escape", action='store_true',
         help="Enable LLM-guided escape when robot is stuck"
+    )
+    parser.add_argument(
+        "--frontier_teleport", action='store_true',
+        help="Enable teleporting to saved frontiers when stuck with no new frontiers"
     )
     parser.add_argument(
         "--reserve_gpu_gb", default=25, type=float,
