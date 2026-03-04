@@ -172,6 +172,11 @@ class SG_Nav_Agent():
         self.max_escape_actions = 15
         self.action_history = []
 
+        # Frontier teleport state
+        self.saved_frontier_positions = []
+        self.frontier_teleport_count = 0
+        self.max_frontier_teleports = 5
+
         # This is to adjust the experiment
         self.experiment_name = 'experiment_0'
 
@@ -287,6 +292,8 @@ class SG_Nav_Agent():
         self.executing_escape = False
         self.escape_attempts = 0
         self.action_history = []
+        self.saved_frontier_positions = []
+        self.frontier_teleport_count = 0
 
         self.scenegraph.reset()
         
@@ -353,6 +360,7 @@ class SG_Nav_Agent():
         self.escape_action_queue = []
         self.executing_escape = False
         self.escape_attempts = 0
+        self.frontier_teleport_count = 0
         
         # IMPORTANT: Reset the local scene graph nodes and edges (but NOT global)
         print(f"[Reset] Resetting LOCAL scene graph (nodes and edges)")
@@ -893,6 +901,9 @@ class SG_Nav_Agent():
             self.not_move_steps = 0
             if self.using_random_goal:
                 self.move_since_random += 1
+            # Save waypoint every 20 movement steps for frontier teleport
+            if self.move_steps % 20 == 0:
+                self._save_agent_waypoint()
             print(f"[Act] Agent moved - Move steps: {self.move_steps}")
         else:
             self.not_move_steps += 1
@@ -993,6 +1004,11 @@ class SG_Nav_Agent():
             self.not_use_random_goal()
             self.goal_map = np.zeros(self.full_map.shape[-2:])
             if self.goal_loc is None:
+                if hasattr(self.args, 'frontier_teleport') and self.args.frontier_teleport \
+                        and self._teleport_to_saved_frontier():
+                    print(f"[Frontier Teleport] Teleported during replan! Returning forward action")
+                    self.prev_action = 1
+                    return {"action": 1}
                 print(f"[Act] FBE returned None, using random goal")
                 self.random_this_ex += 1
                 self.goal_map = self.set_random_goal()
@@ -1073,6 +1089,11 @@ class SG_Nav_Agent():
                         self.goal_map = self.goal_map[::-1]
                         self.using_random_goal = False
                         self.fronter_this_ex += 1
+                    elif hasattr(self.args, 'frontier_teleport') and self.args.frontier_teleport \
+                            and self._teleport_to_saved_frontier():
+                        print(f"[Frontier Teleport] Teleported! Returning forward action to re-observe")
+                        self.prev_action = 1
+                        return {"action": 1}
                     else:
                         print(f"[Act] FBE failed, using random goal")
                         self.goal_map = self.set_random_goal()
@@ -1112,6 +1133,11 @@ class SG_Nav_Agent():
                     self.goal_map = self.goal_map[::-1]
                     self.using_random_goal = False
                     self.fronter_this_ex += 1
+                elif hasattr(self.args, 'frontier_teleport') and self.args.frontier_teleport \
+                        and self._teleport_to_saved_frontier():
+                    print(f"[Frontier Teleport] Teleported! Returning forward action to re-observe")
+                    self.prev_action = 1
+                    return {"action": 1}
                 else:
                     print(f"[Act] FBE failed, using random goal")
                     self.goal_map = self.set_random_goal()
@@ -1183,6 +1209,130 @@ class SG_Nav_Agent():
             new_labels = ['object' for i in labels]
         return new_labels
     
+    def _save_frontier_positions(self, frontier_locations, scores):
+        """Save top-scoring frontier positions along with current agent 3D state."""
+        try:
+            sim = self.simulator._env._sim
+            agent_state = sim.get_agent_state()
+            # Save top 3 scoring frontiers
+            top_k = min(3, len(scores))
+            top_indices = np.argsort(scores)[-top_k:]
+            for idx in top_indices:
+                entry = {
+                    'map_loc': frontier_locations[idx].copy(),
+                    'agent_position': np.array(agent_state.position),
+                    'agent_rotation': np.array([agent_state.rotation.x, agent_state.rotation.y,
+                                                 agent_state.rotation.z, agent_state.rotation.w]),
+                    'step': self.total_steps,
+                }
+                self.saved_frontier_positions.append(entry)
+            # Keep at most 50 saved positions
+            if len(self.saved_frontier_positions) > 50:
+                self.saved_frontier_positions = self.saved_frontier_positions[-50:]
+            print(f"[Frontier Teleport] Saved {top_k} frontier positions "
+                  f"(total saved: {len(self.saved_frontier_positions)})")
+        except Exception as e:
+            print(f"[Frontier Teleport] Error saving frontier positions: {e}")
+
+    def _save_agent_waypoint(self):
+        """Save current agent 3D state as a waypoint for potential teleportation."""
+        if not (hasattr(self.args, 'frontier_teleport') and self.args.frontier_teleport):
+            return
+        try:
+            sim = self.simulator._env._sim
+            agent_state = sim.get_agent_state()
+            entry = {
+                'map_loc': None,
+                'agent_position': np.array(agent_state.position),
+                'agent_rotation': np.array([agent_state.rotation.x, agent_state.rotation.y,
+                                             agent_state.rotation.z, agent_state.rotation.w]),
+                'step': self.total_steps,
+            }
+            self.saved_frontier_positions.append(entry)
+            if len(self.saved_frontier_positions) > 50:
+                self.saved_frontier_positions = self.saved_frontier_positions[-50:]
+        except Exception as e:
+            print(f"[Frontier Teleport] Error saving waypoint: {e}")
+
+    def _teleport_to_saved_frontier(self):
+        """Teleport agent to a random saved frontier/waypoint position.
+        
+        Returns True if teleport succeeded, False otherwise.
+        """
+        if not self.saved_frontier_positions:
+            print(f"[Frontier Teleport] No saved positions to teleport to")
+            return False
+
+        if self.frontier_teleport_count >= self.max_frontier_teleports:
+            print(f"[Frontier Teleport] Max teleports ({self.max_frontier_teleports}) reached")
+            return False
+
+        try:
+            sim = self.simulator._env._sim
+            current_state = sim.get_agent_state()
+            current_pos = np.array(current_state.position)
+
+            # Prefer positions far from current location (at least 1m away)
+            candidates = []
+            for entry in self.saved_frontier_positions:
+                dist = np.linalg.norm(entry['agent_position'] - current_pos)
+                if dist > 1.0:
+                    candidates.append((entry, dist))
+
+            if not candidates:
+                # If no far candidates, use all saved positions
+                candidates = [(e, 0.0) for e in self.saved_frontier_positions]
+
+            # Pick randomly, weighted by distance (prefer farther positions)
+            distances = np.array([d for _, d in candidates])
+            if distances.sum() > 0:
+                probs = distances / distances.sum()
+            else:
+                probs = np.ones(len(candidates)) / len(candidates)
+            chosen_idx = np.random.choice(len(candidates), p=probs)
+            chosen = candidates[chosen_idx][0]
+
+            target_pos = chosen['agent_position'].tolist()
+            target_rot = chosen['agent_rotation'].tolist()
+
+            # Check if position is navigable
+            if hasattr(sim, 'is_navigable') and not sim.is_navigable(target_pos):
+                print(f"[Frontier Teleport] Target position not navigable, trying nearby point")
+                if hasattr(sim, 'pathfinder'):
+                    nearby = sim.pathfinder.get_random_navigable_point_near(
+                        np.array(target_pos), radius=2.0
+                    )
+                    if nearby is not None and sim.is_navigable(nearby.tolist()):
+                        target_pos = nearby.tolist()
+                    else:
+                        print(f"[Frontier Teleport] Could not find navigable point nearby")
+                        return False
+                else:
+                    print(f"[Frontier Teleport] Simulator does not support pathfinding, cannot adjust position")
+                    return False
+
+            # Teleport
+            sim.set_agent_state(target_pos, target_rot)
+            self.frontier_teleport_count += 1
+            
+            # Reinitialize local maps (keep global maps intact)
+            self.init_map()
+            self.first_fbe = True
+            self.found_goal = False
+            self.found_possible_goal = False
+            self.not_move_steps = 0
+            self.loop_time = 0
+            self.using_random_goal = False
+            self.move_since_random = 0
+            
+            print(f"[Frontier Teleport] Teleported to saved position from step {chosen['step']} "
+                  f"(teleport #{self.frontier_teleport_count}/{self.max_frontier_teleports})")
+            print(f"[Frontier Teleport] New position: {target_pos}")
+            return True
+        except Exception as e:
+            print(f"[Frontier Teleport] Teleport failed: {e}")
+            return False
+
     def fbe(self, traversible, start):
         fbe_map = torch.zeros_like(self.full_map[0,0])
         fbe_map[self.fbe_free_map[0,0]>0] = 1 # first free 
@@ -1229,6 +1379,10 @@ class SG_Nav_Agent():
         idx_16_max = idx_16[0][np.argmax(scores)]
         goal = frontier_locations[idx_16_max] - 1
         self.scores = scores
+
+        # Save top frontier positions for potential teleportation
+        if hasattr(self.args, 'frontier_teleport') and self.args.frontier_teleport:
+            self._save_frontier_positions(frontier_locations_16, scores)
 
         # Clean up GPU tensors
         del fbe_map, fbe_cp, fbe_cpp, diff, frontier_map
