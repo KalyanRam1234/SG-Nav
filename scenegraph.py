@@ -16,8 +16,9 @@ from sklearn.cluster import DBSCAN
 
 from segment_anything import SamAutomaticMaskGenerator, SamPredictor, sam_model_registry
 from GroundingDINO.groundingdino.datasets import transforms as T
+from transformers import CLIPModel, CLIPProcessor
 
-from utils.utils_scenegraph.mapping import compute_spatial_similarities, merge_detections_to_objects
+from utils.utils_scenegraph.mapping import compute_spatial_similarities, compute_visual_similarities, aggregate_similarities, merge_detections_to_objects
 from utils.utils_scenegraph.slam_classes import MapObjectList
 from utils.utils_scenegraph.utils import filter_objects, gobs_to_detection_list, text2value
 from utils.utils_scenegraph.grounded_sam_demo import get_grounding_output, load_image, load_model
@@ -71,7 +72,20 @@ class GroupNode():
 
 
 class ObjectNode():
-    def __init__(self):
+    _next_id = 0
+
+    @classmethod
+    def _gen_id(cls):
+        nid = cls._next_id
+        cls._next_id += 1
+        return nid
+
+    @classmethod
+    def reset_id_counter(cls):
+        cls._next_id = 0
+
+    def __init__(self, node_id=None):
+        self.id = node_id if node_id is not None else ObjectNode._gen_id()
         self.is_new_node = True
         self.is_goal_node = False
         self.caption = None
@@ -83,6 +97,9 @@ class ObjectNode():
         self.distance = 2
         self.score = 0.5
         self.edges = set()
+
+    def __repr__(self):
+        return f"ObjectNode(id={self.id}, caption={self.caption!r})"
 
     def __lt__(self, other):
         return self.score < other.score
@@ -170,8 +187,8 @@ class SceneGraph():
         self.segment2d_results = []
         self.max_detections_per_object = 10
         
-        self.threshold_list = {'bathtub': 2, 'bed': 7, 'cabinet': 3, 'chair': 5, 'chest_of_drawers': 5, 'clothes': 9, 'counter': 4, 'cushion': 7, 'fireplace': 4, 'gym_equipment': 7, 'picture': 9, 'plant': 3, 'seating': 2, 'shower': 2, 'sink': 3, 'sofa': 9, 'stool': 5, 'table': 8, 'toilet': 3, 'towel': 4, 'tv_monitor': 2, 'treadmill. fitness equipment.': 0,
-            'lamp': 3, 'mirror': 3, 'rug': 4, 'curtain': 4, 'shelf': 3, 'desk': 5, 'door': 3, 'window': 3, 'pillow': 4, 'blanket': 4}
+        self.threshold_list = {'bathtub': 1, 'bed': 3, 'cabinet': 2, 'chair': 2, 'chest_of_drawers': 2, 'clothes': 4, 'counter': 2, 'cushion': 3, 'fireplace': 2, 'gym_equipment': 3, 'picture': 4, 'plant': 2, 'seating': 1, 'shower': 1, 'sink': 2, 'sofa': 4, 'stool': 2, 'table': 3, 'toilet': 2, 'towel': 2, 'tv_monitor': 1, 'treadmill. fitness equipment.': 0,
+            'lamp': 2, 'mirror': 2, 'rug': 2, 'curtain': 2, 'shelf': 2, 'desk': 2, 'door': 2, 'window': 2, 'pillow': 2, 'blanket': 2}
         self.small_objects = ['bathtub', 'chest_of_drawers', 'cushion', 'plant', 'seating', 'shower', 'toilet', 'tv_monitor',
             'lamp', 'mirror', 'pillow', 'blanket']
         self.found_goal_times_threshold = 1
@@ -208,6 +225,15 @@ Object pair(s):
         self.prompt_graph_corr_2 = 'Here is the objects and relationships near A: [{}] You answer the following question with a short sentence based on this information. Question: {}'
         self.prompt_graph_corr_3 = 'The probability of A and B appearing together is about {}. Based on the dialog: [{}], re-determine the probability of A and B appearing together. A:[{}], B:[{}]. Even if you do not have enough information, you have to answer with a value from 0 to 1 anyway. Answer only the value of probability and do not answer any other text.'
         self.mask_generator = self.get_sam_mask_generator(self.sam_variant, self.device)
+        
+        # Load CLIP model for text and visual embeddings (DovSG-style)
+        clip_model_name = "openai/clip-vit-base-patch32"
+        print(f"[SceneGraph] Loading CLIP model: {clip_model_name}")
+        self.clip_model = CLIPModel.from_pretrained(clip_model_name).to(self.device)
+        self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+        self.clip_model.eval()
+        print(f"[SceneGraph] CLIP model loaded successfully")
+        
         self.set_cfg()
         self.set_agent(agent)
 
@@ -244,12 +270,14 @@ Object pair(s):
         self.edge_text = ''
         self.edge_list = []
         self.reason_visualization = ''
+        ObjectNode.reset_id_counter()
 
     def set_cfg(self):
-        cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': 'cuda', 'use_iou': True, 'spatial_sim_type': 'overlap', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.025, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 10, 'obj_min_points': 0, 'obj_min_detections': 3, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
+        cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': 'cuda', 'use_iou': True, 'spatial_sim_type': 'iou_accurate', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.01, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 5, 'obj_min_points': 0, 'obj_min_detections': 2, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
         cfg = DictConfig(cfg)
         if self.is_navigation:
-            cfg.sim_threshold = 0.8
+            # Threshold for aggregate similarity (weighted avg of spatial + visual, range [0,1])
+            cfg.sim_threshold = 0.6
             cfg.sim_threshold_spatial = 0.01
         self.cfg = cfg
 
@@ -427,31 +455,27 @@ Object pair(s):
         else:
             raise NotImplementedError
 
-    def compute_clip_features(self, image, detections, clip_model, clip_preprocess, clip_tokenizer, classes, device):
-        backup_image = image.copy()
-        
+    def compute_clip_features(self, image, detections, classes):
+        """Compute CLIP image and text features for each detection.
+        Uses HuggingFace CLIPModel + CLIPProcessor.
+        Returns: image_crops, image_feats (N, D), text_feats (N, D) as numpy arrays.
+        """
         image = Image.fromarray(image)
-        
-        # padding = args.clip_padding  # Adjust the padding amount as needed
-        padding = 20  # Adjust the padding amount as needed
+        padding = 20
         
         image_crops = []
         image_feats = []
         text_feats = []
-
         
         for idx in range(len(detections.xyxy)):
-            # Get the crop of the mask with padding
             x_min, y_min, x_max, y_max = detections.xyxy[idx]
 
-            # Check and adjust padding to avoid going beyond the image borders
             image_width, image_height = image.size
             left_padding = min(padding, x_min)
             top_padding = min(padding, y_min)
             right_padding = min(padding, image_width - x_max)
             bottom_padding = min(padding, image_height - y_max)
 
-            # Apply the adjusted padding
             x_min -= left_padding
             y_min -= top_padding
             x_max += right_padding
@@ -459,16 +483,18 @@ Object pair(s):
 
             cropped_image = image.crop((x_min, y_min, x_max, y_max))
             
-            # Get the preprocessed image for clip from the crop 
-            preprocessed_image = clip_preprocess(cropped_image).unsqueeze(0).to("cuda")
-
-            crop_feat = clip_model.encode_image(preprocessed_image)
-            crop_feat /= crop_feat.norm(dim=-1, keepdim=True)
+            # Compute CLIP image embedding
+            image_inputs = self.clip_processor(images=cropped_image, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                crop_feat = self.clip_model.get_image_features(**image_inputs)
+            crop_feat = crop_feat / crop_feat.norm(dim=-1, keepdim=True)
             
+            # Compute CLIP text embedding from class label
             class_id = detections.class_id[idx]
-            tokenized_text = clip_tokenizer([classes[class_id]]).to("cuda")
-            text_feat = clip_model.encode_text(tokenized_text)
-            text_feat /= text_feat.norm(dim=-1, keepdim=True)
+            text_inputs = self.clip_processor(text=[classes[class_id]], return_tensors="pt", padding=True).to(self.device)
+            with torch.no_grad():
+                text_feat = self.clip_model.get_text_features(**text_inputs)
+            text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
             
             crop_feat = crop_feat.cpu().numpy()
             text_feat = text_feat.cpu().numpy()
@@ -476,8 +502,9 @@ Object pair(s):
             image_crops.append(cropped_image)
             image_feats.append(crop_feat)
             text_feats.append(text_feat)
+
+            del image_inputs, text_inputs
             
-        # turn the list of feats into np matrices
         image_feats = np.concatenate(image_feats, axis=0)
         text_feats = np.concatenate(text_feats, axis=0)
 
@@ -552,26 +579,26 @@ Object pair(s):
             self.seg_xyxy = xyxy
             self.seg_caption = caption
             if caption is None:
+                print(f"[Segment2D] No detections (caption=None), skipping frame")
                 return
+            print(f"[Segment2D] Detected {len(mask)} segments: {caption}")
             detections = sv.Detections(
                 xyxy=xyxy,
                 confidence=conf,
                 class_id=np.zeros_like(conf).astype(int),
                 mask=mask,
             )
-            # with torch.no_grad():
-            #     image_crops, image_feats, text_feats = self.compute_clip_features(image_rgb, detections, self.clip_model, self.clip_preprocess, self.clip_tokenizer, self.classes, self.device)
-            # image_appear_efficiency = [''] * len(image_crops)
-            image_appear_efficiency = [''] * len(mask)
+            with torch.no_grad():
+                image_crops, image_feats, text_feats = self.compute_clip_features(self.image_rgb, detections, self.classes)
+            image_appear_efficiency = [''] * len(image_crops)
             self.segment2d_results.append({
                 "xyxy": detections.xyxy,
                 "confidence": detections.confidence,
                 "class_id": detections.class_id,
                 "mask": detections.mask,
                 "classes": self.classes,
-                # "image_crops": image_crops,
-                # "image_feats": image_feats,
-                # "text_feats": text_feats,
+                "image_feats": image_feats,
+                "text_feats": text_feats,
                 "image_appear_efficiency": image_appear_efficiency,
                 "image_rgb": self.image_rgb,
                 "caption": caption,
@@ -600,31 +627,51 @@ Object pair(s):
         )
         
         if len(fg_detection_list) == 0:
+            print(f"[Mapping3D] No foreground detections after 3D mapping")
             return
             
         if len(self.objects) == 0:
             # Add all detections to the map
             for i in range(len(fg_detection_list)):
                 self.objects.append(fg_detection_list[i])
+            print(f"[Mapping3D] First frame: added {len(fg_detection_list)} objects (no prior objects to match)")
 
             # Skip the similarity computation 
             self.objects_post = filter_objects(self.cfg, self.objects)
             return
                 
         spatial_sim = compute_spatial_similarities(self.cfg, fg_detection_list, self.objects)
-        # visual_sim = compute_visual_similarities(self.cfg, fg_detection_list, self.objects)
-        # agg_sim = aggregate_similarities(self.cfg, spatial_sim, visual_sim)
+        visual_sim = compute_visual_similarities(self.cfg, fg_detection_list, self.objects)
+        agg_sim = aggregate_similarities(self.cfg, spatial_sim, visual_sim)
+
+        # Log per-detection similarity scores before thresholding
+        num_new = 0
+        num_merged = 0
+        for i in range(agg_sim.shape[0]):
+            best_j = agg_sim[i].argmax().item()
+            best_spatial = spatial_sim[i, best_j].item()
+            best_visual = visual_sim[i, best_j].item()
+            best_agg = agg_sim[i, best_j].item()
+            det_caption = fg_detection_list[i].get('class_name', '?')
+            obj_caption = self.objects[best_j].get('class_name', '?') if best_j < len(self.objects) else '?'
+            if best_agg < self.cfg.sim_threshold:
+                num_new += 1
+                print(f"[Mapping3D]   NEW object '{det_caption}' | best match '{obj_caption}' "
+                      f"spatial={best_spatial:.3f} visual={best_visual:.3f} agg={best_agg:.3f} < threshold={self.cfg.sim_threshold}")
+            else:
+                num_merged += 1
+                print(f"[Mapping3D]   MERGED '{det_caption}' -> '{obj_caption}' "
+                      f"spatial={best_spatial:.3f} visual={best_visual:.3f} agg={best_agg:.3f} >= threshold={self.cfg.sim_threshold}")
+        print(f"[Mapping3D] {len(fg_detection_list)} detections: {num_new} new, {num_merged} merged into existing (total objects: {len(self.objects)})")
         
-        # Threshold sims according to cfg. Set to negative infinity if below threshold
-        # agg_sim[agg_sim < self.cfg.sim_threshold] = float('-inf')
-        spatial_sim[spatial_sim < self.cfg.sim_threshold_spatial] = float('-inf')
+        # Threshold combined sim. Set to negative infinity if below threshold
+        agg_sim[agg_sim < self.cfg.sim_threshold] = float('-inf')
         
-        # self.objects = merge_detections_to_objects(self.cfg, fg_detection_list, self.objects, agg_sim)
-        self.objects = merge_detections_to_objects(self.cfg, fg_detection_list, self.objects, spatial_sim)
+        self.objects = merge_detections_to_objects(self.cfg, fg_detection_list, self.objects, agg_sim)
         self.objects_post = filter_objects(self.cfg, self.objects)
 
         # Clean up intermediate tensors
-        del spatial_sim, fg_detection_list, bg_detection_list
+        del spatial_sim, visual_sim, agg_sim, fg_detection_list, bg_detection_list
             
     def get_caption(self):
         if self.sam_variant == 'groundedsam':
@@ -642,15 +689,21 @@ Object pair(s):
             caption_ori = node.caption
             caption_new = node.object['captions'][0]
             if caption_ori != caption_new:
+                print(f"[UpdateNode] Renamed node '{caption_ori}' -> '{caption_new}'")
                 node.set_caption(caption_new)
         # add new nodes
         new_objects = list(filter(lambda object: 'node' not in object, self.objects_post))
+        if new_objects:
+            new_captions = [obj['captions'][0] for obj in new_objects]
+            print(f"[UpdateNode] Adding {len(new_objects)} new nodes: {new_captions}")
         for new_object in new_objects:
             new_node = ObjectNode()
             caption = new_object['captions'][0]
             new_node.set_caption(caption)
             new_node.set_object(new_object)
             self.nodes.append(new_node)
+        existing_captions = [n.caption for n in self.nodes]
+        print(f"[UpdateNode] Total nodes now: {len(self.nodes)} -> {existing_captions}")
         # get node.center and node.room
         for node in self.nodes:
             points = np.asarray(node.object['pcd'].points)
@@ -794,6 +847,10 @@ Object pair(s):
                 entry['xyxy'] = None
             if 'confidence' in entry and entry['confidence'] is not None:
                 entry['confidence'] = None
+            if 'image_feats' in entry and entry['image_feats'] is not None:
+                entry['image_feats'] = None
+            if 'text_feats' in entry and entry['text_feats'] is not None:
+                entry['text_feats'] = None
 
     def update_scenegraph(self):
         print(f'Navigate Step: {self.navigate_steps}', end='\r')
@@ -987,6 +1044,8 @@ Object pair(s):
                 obj['mask'] = [np.array(m, dtype=bool) if isinstance(m, list) else m for m in v]
             elif k == 'inst_color':
                 obj[k] = np.array(v) if isinstance(v, list) else v
+            elif k in ('clip_ft', 'text_ft'):
+                obj[k] = torch.tensor(v) if isinstance(v, list) else v
             else:
                 obj[k] = v
         # Reconstruct open3d objects
@@ -1010,6 +1069,7 @@ Object pair(s):
         s_nodes = []
         for node in self.nodes:
             s_node = {
+                'id': node.id,
                 'caption': node.caption,
                 'center': list(node.center) if node.center is not None else None,
                 'score': node.score,
@@ -1044,6 +1104,20 @@ Object pair(s):
                         'relation': edge.relation,
                     })
 
+        # Serialize group nodes (per room)
+        s_groups = []
+        for rn in self.room_nodes:
+            for gn in rn.group_nodes:
+                member_idxs = [node_to_idx[id(n)] for n in gn.nodes if id(n) in node_to_idx]
+                s_groups.append({
+                    'caption': gn.caption,
+                    'exploration_level': gn.exploration_level,
+                    'corr_score': gn.corr_score,
+                    'center': list(gn.center) if gn.center is not None else None,
+                    'room_idx': self.room_nodes.index(rn),
+                    'node_idxs': member_idxs,
+                })
+
         # Serialize room nodes
         s_rooms = []
         for rn in self.room_nodes:
@@ -1061,6 +1135,7 @@ Object pair(s):
             'nodes': s_nodes,
             'edges': s_edges,
             'room_nodes': s_rooms,
+            'group_nodes': s_groups,
             'objects_post': s_objects_post,
             'visited': self.visited.copy(),
             'num_of_goal': self.num_of_goal.cpu().numpy(),
@@ -1077,8 +1152,12 @@ Object pair(s):
 
         # Restore nodes
         self.nodes = []
+        max_id = -1
         for s_node in data['nodes']:
-            node = ObjectNode()
+            restored_id = s_node.get('id')
+            node = ObjectNode(node_id=restored_id)
+            if restored_id is not None and restored_id > max_id:
+                max_id = restored_id
             node.caption = s_node['caption']
             node.center = s_node['center']
             node.score = s_node['score']
@@ -1095,6 +1174,9 @@ Object pair(s):
                 obj['node'] = node  # restore back-reference
                 node.object = obj
             self.nodes.append(node)
+
+        # Ensure new nodes created after deserialization get unique IDs
+        ObjectNode._next_id = max(ObjectNode._next_id, max_id + 1)
 
         # Restore edges
         self.edge_list = []

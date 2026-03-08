@@ -1,6 +1,8 @@
 import torch
-from .slam_classes import MapObjectList, DetectionList
+import torch.nn.functional as F
+from .slam_classes import MapObjectList, DetectionList, to_tensor
 from .utils import compute_overlap_matrix_2set, merge_obj2_into_obj1
+from .iou import compute_iou_batch, compute_3d_iou_accuracte_batch
 
 
 
@@ -20,11 +22,11 @@ def compute_spatial_similarities(cfg, detection_list: DetectionList, objects: Ma
     if cfg.spatial_sim_type == "iou":
         spatial_sim = compute_iou_batch(det_bboxes, obj_bboxes)
     elif cfg.spatial_sim_type == "giou":
-        spatial_sim = compute_giou_batch(det_bboxes, obj_bboxes)
+        raise NotImplementedError("GIoU batch computation is not implemented")
     elif cfg.spatial_sim_type == "iou_accurate":
         spatial_sim = compute_3d_iou_accuracte_batch(det_bboxes, obj_bboxes)
     elif cfg.spatial_sim_type == "giou_accurate":
-        spatial_sim = compute_3d_giou_accurate_batch(det_bboxes, obj_bboxes)
+        raise NotImplementedError("Accurate GIoU batch computation is not implemented")
     elif cfg.spatial_sim_type == "overlap":
         spatial_sim = compute_overlap_matrix_2set(cfg, objects, detection_list)
         spatial_sim = torch.from_numpy(spatial_sim).T
@@ -32,6 +34,49 @@ def compute_spatial_similarities(cfg, detection_list: DetectionList, objects: Ma
         raise ValueError(f"Invalid spatial similarity type: {cfg.spatial_sim_type}")
     
     return spatial_sim
+
+
+def compute_visual_similarities(cfg, detection_list: DetectionList, objects: MapObjectList) -> torch.Tensor:
+    '''
+    Compute CLIP visual similarities between new detections and existing objects.
+    Uses cosine similarity between CLIP image features (clip_ft).
+
+    Args:
+        detection_list: a list of M new detections (each with 'clip_ft')
+        objects: a list of N existing objects in the map (each with 'clip_ft')
+    Returns:
+        A MxN tensor of visual similarities (cosine similarity values)
+    '''
+    det_feats = detection_list.get_stacked_values_torch('clip_ft')  # (M, D)
+    obj_feats = objects.get_stacked_values_torch('clip_ft')         # (N, D)
+    
+    # Normalize for cosine similarity
+    det_feats = F.normalize(det_feats.float(), dim=-1)
+    obj_feats = F.normalize(obj_feats.float(), dim=-1)
+    
+    # (M, D) @ (D, N) -> (M, N)
+    visual_sim = det_feats @ obj_feats.T
+    
+    return visual_sim
+
+
+def aggregate_similarities(cfg, spatial_sim: torch.Tensor, visual_sim: torch.Tensor) -> torch.Tensor:
+    '''
+    Combine spatial and visual similarities into an aggregate score.
+    DovSG-style: weighted sum of spatial overlap and CLIP visual similarity.
+    Spatial is weighted higher to prevent merging visually-similar but
+    physically-distinct objects (e.g. two chairs across a room).
+
+    Args:
+        spatial_sim: MxN spatial similarity matrix
+        visual_sim: MxN visual similarity matrix
+    Returns:
+        MxN aggregated similarity matrix
+    '''
+    w_spatial = 0.7
+    w_visual = 0.3
+    agg_sim = w_spatial * spatial_sim + w_visual * visual_sim
+    return agg_sim
 
 
 def merge_detections_to_objects(

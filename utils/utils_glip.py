@@ -30,6 +30,11 @@ categories_21 = ['chair', 'table', 'picture', 'cabinet', 'cushion', 'sofa',
 
 categories_21_origin = copy.deepcopy(categories_21)
 
+# Extended categories for scene graph (includes objects beyond ObjectNav 21)
+categories_extended = copy.deepcopy(categories_21_origin) + [
+    'lamp', 'mirror', 'rug', 'curtain', 'shelf', 'desk',
+    'door', 'window', 'pillow', 'blanket'
+]
 
 categories_21.append('heater')
 categories_21.append('window')

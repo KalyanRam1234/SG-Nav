@@ -1,11 +1,12 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 from collections import Counter
 import cv2
 import open3d as o3d
 from omegaconf import DictConfig
 import faiss
-from .slam_classes import MapObjectList, DetectionList
+from .slam_classes import MapObjectList, DetectionList, to_tensor
 from .iou import compute_3d_iou_accuracte_batch, compute_iou_batch, mask_subtract_contained
 
 
@@ -284,8 +285,8 @@ def gobs_to_detection_list(
             # These are for the entire 3D object
             'pcd': global_object_pcd,
             'bbox': pcd_bbox,
-            # 'clip_ft': to_tensor(gobs['image_feats'][mask_idx]),  # annotated by someone
-            # 'text_ft': to_tensor(gobs['text_feats'][mask_idx]),
+            'clip_ft': to_tensor(gobs['image_feats'][mask_idx]),
+            'text_ft': to_tensor(gobs['text_feats'][mask_idx]),
         }
         
         if class_name in BG_CLASSES:
@@ -351,7 +352,7 @@ def compute_overlap_matrix_2set(cfg, objects_map: MapObjectList, objects_new: De
     # Compute the pairwise overlaps
     for i in range(m):
         for j in range(n):
-            if iou[i,j] < 1e-6:
+            if iou[i,j] < 1e-2:
                 continue
             
             D, I = indices[i].search(points_new[j], 1) # search new object j in map object i
@@ -465,19 +466,21 @@ def merge_obj2_into_obj1(cfg, obj1, obj2, run_dbscan=True):
     obj1['bbox'] = get_bounding_box(cfg, obj1['pcd'])
     obj1['bbox'].color = [0,1,0]
     
-    # # merge clip ft  # annotated by someone
-    # obj1['clip_ft'] = (obj1['clip_ft'] * n_obj1_det +
-    #                    obj2['clip_ft'] * n_obj2_det) / (
-    #                    n_obj1_det + n_obj2_det)
-    # obj1['clip_ft'] = F.normalize(obj1['clip_ft'], dim=0)
+    # Merge clip_ft via running average (DovSG-style)
+    obj1['clip_ft'] = to_tensor(obj1['clip_ft'])
+    obj2['clip_ft'] = to_tensor(obj2['clip_ft'])
+    obj1['clip_ft'] = (obj1['clip_ft'] * n_obj1_det +
+                       obj2['clip_ft'] * n_obj2_det) / (
+                       n_obj1_det + n_obj2_det)
+    obj1['clip_ft'] = F.normalize(obj1['clip_ft'], dim=0)
 
-    # # merge text_ft
-    # obj2['text_ft'] = to_tensor(obj2['text_ft'], cfg.device)
-    # obj1['text_ft'] = to_tensor(obj1['text_ft'], cfg.device)
-    # obj1['text_ft'] = (obj1['text_ft'] * n_obj1_det +
-    #                    obj2['text_ft'] * n_obj2_det) / (
-    #                    n_obj1_det + n_obj2_det)
-    # obj1['text_ft'] = F.normalize(obj1['text_ft'], dim=0)
+    # Merge text_ft via running average
+    obj2['text_ft'] = to_tensor(obj2['text_ft'])
+    obj1['text_ft'] = to_tensor(obj1['text_ft'])
+    obj1['text_ft'] = (obj1['text_ft'] * n_obj1_det +
+                       obj2['text_ft'] * n_obj2_det) / (
+                       n_obj1_det + n_obj2_det)
+    obj1['text_ft'] = F.normalize(obj1['text_ft'], dim=0)
     
     return obj1
 

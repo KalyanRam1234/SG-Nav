@@ -156,7 +156,7 @@ class SG_Nav_Agent():
         self.global_scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self)
 
         self.target_objects_list = [
-            'chair', 'table', 'shower', 'sofa', 'cabinet', 'plant', 'lamp', 'picture',
+            'chair', 'table', 'sofa', 'cabinet', 'plant', 'lamp', 'picture', 'shower',
             'toilet', 'tv_monitor', 'sink', 'bathtub', 'counter', 'fireplace', 'gym_equipment'
         ]
 
@@ -185,6 +185,7 @@ class SG_Nav_Agent():
 
         self.visualization_dir = f'data/visualization/{self.experiment_name}/'
 
+        self.toggle_stuck_handling = True
         print('scene graph module init finish!!!')
 
     def add_predicates(self, model):
@@ -373,10 +374,17 @@ class SG_Nav_Agent():
         new_labels = self.get_glip_real_label(self.current_obj_predictions) # transfer int labels to string labels
         self.current_obj_predictions.add_field("labels", new_labels)
 
-        
+        obj_labels = self.current_obj_predictions.get_field("labels")
+        obj_scores = self.current_obj_predictions.get_field("scores")
+        detected_summary = {}
+        for j, label in enumerate(obj_labels):
+            if label not in detected_summary:
+                detected_summary[label] = 0
+            detected_summary[label] += 1
+        print(f"[DetectObjects] GLIP detected {len(obj_labels)} objects: {detected_summary}")
+
         shortest_distance = 120
         shortest_distance_angle = 0
-        obj_labels = self.current_obj_predictions.get_field("labels")
         goal_bbox = []
         for j, label in enumerate(obj_labels):
             if self.obj_goal in label:
@@ -746,7 +754,7 @@ class SG_Nav_Agent():
                 if self.args.visualize:
                     print(f"[Act] Saving video for object: {self.obj_goal}")
                     self.save_video_for_object(self.obj_goal)
-                self.save_global_scenegraph(tag=f"goal_{self.obj_goal}")
+                self.save_global_scenegraph(tag=f"goal_{self.obj_goal}_{self.target_object_idx}_moving_on_post_300_steps")
                 self.reset_local_scenegraph()
             else:
                 # All objects found
@@ -810,7 +818,9 @@ class SG_Nav_Agent():
         self.scenegraph.set_full_map(self.full_map)
         self.scenegraph.set_full_pose(self.full_pose)
         self.scenegraph.update_scenegraph()
+        local_node_captions = [n.caption for n in self.scenegraph.nodes]
         print(f"[Act] LOCAL scene graph updated - Nodes: {len(self.scenegraph.nodes)}, Edges: {len(self.scenegraph.get_edges())}")
+        print(f"[Act] LOCAL nodes: {local_node_captions}")
         
         # Update GLOBAL scene graph (persistent)
         print(f"[Act] Updating GLOBAL scene graph...")
@@ -823,7 +833,9 @@ class SG_Nav_Agent():
         self.global_scenegraph.set_full_map(self.global_full_map)
         self.global_scenegraph.set_full_pose(self.full_pose)
         self.global_scenegraph.update_scenegraph()
+        global_node_captions = [n.caption for n in self.global_scenegraph.nodes]
         print(f"[Act] GLOBAL scene graph updated - Nodes: {len(self.global_scenegraph.nodes)}, Edges: {len(self.global_scenegraph.get_edges())}")
+        print(f"[Act] GLOBAL nodes: {global_node_captions}")
 
         # Need Global ones too, done
         print(f"[Act] Updating local maps...")
@@ -940,7 +952,7 @@ class SG_Nav_Agent():
                 if self.args.visualize:
                     print(f"[Act] Saving video for object: {self.obj_goal}")
                     self.save_video_for_object(self.obj_goal)
-                self.save_global_scenegraph(tag=f"goal_{self.obj_goal}")
+                self.save_global_scenegraph(tag=f"goal_{self.obj_goal}_{self.target_object_idx}_found")
                 self.reset_local_scenegraph()
             else:
                 # All objects found
@@ -1049,11 +1061,11 @@ class SG_Nav_Agent():
         print(f"[Act] Stuck detection - not_move_steps: {self.not_move_steps}, found_goal: {self.found_goal}, action: {number_action}")
         
         # Only enter stuck recovery if we're truly stuck (action=0 without goal, OR stationary too long)
-        if (not self.found_goal and number_action == 0) or self.not_move_steps >= 7:
+        if (not self.found_goal and number_action == 0) or self.not_move_steps >= 4:
             print(f"[Act] Agent stuck! Attempting recovery...")
             
             # If stationary too long, reset goal flags
-            if self.not_move_steps >= 7:
+            if self.not_move_steps >= 4:
                 print(f"[Act] Stationary for {self.not_move_steps} steps, resetting goal flags")
                 self.found_goal = False
                 self.found_possible_goal = False
@@ -1070,73 +1082,35 @@ class SG_Nav_Agent():
                     self.fbe_free_map[0, 0, x_0:x_1, y_0:y_1] = 0
                     self.global_fbe_free_map[0, 0, x_0:x_1, y_0:y_1] = 0
             
-            # === LLM ESCAPE MODE ===
+            # === LLM ESCAPE MODE (tried first if enabled) ===
+            llm_escaped = False
             if hasattr(self.args, 'llm_escape') and self.args.llm_escape \
                     and self.escape_attempts < self.max_escape_attempts:
                 if self.llm_plan_escape(observations):
                     number_action = self.escape_action_queue.pop(0)
                     print(f"[LLM Escape] Starting escape with action: {number_action}")
+                    llm_escaped = True
                 else:
                     print(f"[LLM Escape] VLM failed, falling back to primitive recovery")
-                    # Primitive recovery fallback
-                    print(f"[Act] Computing new FBE goal to escape...")
-                    new_goal_loc = self.fbe(traversible, cur_start)
-                    
-                    if new_goal_loc is not None:
-                        print(f"[Act] FBE found escape frontier at: {new_goal_loc}")
-                        self.goal_map = np.zeros(self.full_map.shape[-2:])
-                        self.goal_map[new_goal_loc[0], new_goal_loc[1]] = 1
-                        self.goal_map = self.goal_map[::-1]
-                        self.using_random_goal = False
-                        self.fronter_this_ex += 1
-                    elif hasattr(self.args, 'frontier_teleport') and self.args.frontier_teleport \
-                            and self._teleport_to_saved_frontier():
-                        print(f"[Frontier Teleport] Teleported! Returning forward action to re-observe")
-                        self.prev_action = 1
-                        return {"action": 1}
-                    else:
-                        print(f"[Act] FBE failed, using random goal")
-                        self.goal_map = self.set_random_goal()
-                        self.using_random_goal = True
-                        self.random_this_ex += 1
-                    
-                    stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
-                    print(f"[Act] New plan: STG=({stg_y:.2f}, {stg_x:.2f}), Action={number_action}")
-                    
-                    if number_action == 0:
-                        self.loop_time += 1
-                        if self.loop_time <= 3:
-                            if self.loop_time % 2 == 1:
-                                number_action = 2
-                                print(f"[Act] Forcing turn LEFT to break stuck cycle (attempt {self.loop_time})")
-                            else:
-                                number_action = 3
-                                print(f"[Act] Forcing turn RIGHT to break stuck cycle (attempt {self.loop_time})")
-                        elif self.loop_time <= 6:
-                            number_action = 1
-                            print(f"[Act] Forcing FORWARD movement to break stuck cycle (attempt {self.loop_time})")
-                        else:
-                            print(f"[Act] Failed to unstuck after {self.loop_time} attempts")
-                            self.loop_time = 0
-                            number_action = 1
-                    else:
-                        self.loop_time = 0
-            else:
-                # Primitive recovery (existing logic)
+
+            # === PRIMITIVE RECOVERY (FBE → frontier teleport → random goal) ===
+            if not llm_escaped:
                 print(f"[Act] Computing new FBE goal to escape...")
                 new_goal_loc = self.fbe(traversible, cur_start)
                 
-                if new_goal_loc is not None:
+                if new_goal_loc is not None and self.toggle_stuck_handling:
                     print(f"[Act] FBE found escape frontier at: {new_goal_loc}")
                     self.goal_map = np.zeros(self.full_map.shape[-2:])
                     self.goal_map[new_goal_loc[0], new_goal_loc[1]] = 1
                     self.goal_map = self.goal_map[::-1]
                     self.using_random_goal = False
                     self.fronter_this_ex += 1
+                    self.toggle_stuck_handling = False
                 elif hasattr(self.args, 'frontier_teleport') and self.args.frontier_teleport \
                         and self._teleport_to_saved_frontier():
                     print(f"[Frontier Teleport] Teleported! Returning forward action to re-observe")
                     self.prev_action = 1
+                    self.toggle_stuck_handling = True  # Allow FBE to select new goal on next step after teleport
                     return {"action": 1}
                 else:
                     print(f"[Act] FBE failed, using random goal")
@@ -1151,13 +1125,13 @@ class SG_Nav_Agent():
                     self.loop_time += 1
                     if self.loop_time <= 3:
                         if self.loop_time % 2 == 1:
-                            number_action = 2  # Turn left
+                            number_action = 2
                             print(f"[Act] Forcing turn LEFT to break stuck cycle (attempt {self.loop_time})")
                         else:
-                            number_action = 3  # Turn right
+                            number_action = 3
                             print(f"[Act] Forcing turn RIGHT to break stuck cycle (attempt {self.loop_time})")
                     elif self.loop_time <= 6:
-                        number_action = 1  # Move forward
+                        number_action = 1
                         print(f"[Act] Forcing FORWARD movement to break stuck cycle (attempt {self.loop_time})")
                     else:
                         print(f"[Act] Failed to unstuck after {self.loop_time} attempts")
@@ -1716,7 +1690,9 @@ class SG_Nav_Agent():
             'total_steps': self.total_steps,
         }
 
-        filepath = os.path.join(save_dir, f'global_sg_{tag}.pkl')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        filepath = os.path.join(save_dir, f'global_sg_{tag}_{timestamp}.pkl')
         with open(filepath, 'wb') as f:
             pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         print(f'Global scene graph saved to {filepath}')
@@ -1878,7 +1854,7 @@ def _get_free_and_total_gpu_memory():
     return free_mb * 1024**2, total_mb * 1024**2
 
 
-def _reserve_gpu_memory(reserve_gb=25):
+def _reserve_gpu_memory(reserve_gb=20):
     """Pre-reserve GPU memory so other processes can't claim it.
     PyTorch's caching allocator keeps the memory even after the tensor is freed."""
     if torch.cuda.is_available():
