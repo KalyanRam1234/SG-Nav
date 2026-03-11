@@ -256,7 +256,7 @@ class SceneGraph():
         self.segment2d_results = []
         self.max_detections_per_object = 10
         
-        self.threshold_list = {'bathtub': 1, 'bed': 3, 'cabinet': 2, 'chair': 2, 'chest_of_drawers': 2, 'clothes': 4, 'counter': 2, 'cushion': 3, 'fireplace': 2, 'gym_equipment': 3, 'picture': 4, 'plant': 2, 'seating': 1, 'shower': 1, 'sink': 2, 'sofa': 4, 'stool': 2, 'table': 3, 'toilet': 2, 'towel': 2, 'tv_monitor': 1, 'treadmill. fitness equipment.': 0,
+        self.threshold_list = {'bathtub': 1, 'bed': 3, 'cabinet': 2, 'chair': 2, 'chest_of_drawers': 2, 'clothes': 4, 'counter': 2, 'cushion': 3, 'fireplace': 2, 'gym_equipment': 3, 'picture': 4, 'plant': 2, 'seating': 1, 'shower': 1, 'sink': 2, 'sofa': 4, 'stool': 2, 'table': 3, 'toilet': 2, 'towel': 2, 'tv_monitor': 1, 'treadmill': 2, 'fitness equipment': 2,
             'lamp': 2, 'mirror': 2, 'rug': 2, 'curtain': 2, 'shelf': 2, 'desk': 2, 'door': 2, 'window': 2, 'pillow': 2, 'blanket': 2}
         self.small_objects = ['bathtub', 'chest_of_drawers', 'cushion', 'plant', 'seating', 'shower', 'toilet', 'tv_monitor',
             'lamp', 'mirror', 'pillow', 'blanket']
@@ -778,7 +778,9 @@ Object pair(s):
                 caption_list = []
                 for idx_det in range(len(object["image_idx"])):
                     caption = self.segment2d_results[object["image_idx"][idx_det]]['caption'][object["mask_idx"][idx_det]]
-                    caption_list = caption_list + caption.split(' ')
+                    # Treat the full phrase as one entry (don't split multi-word
+                    # captions like "fitness equipment" into individual words)
+                    caption_list.append(caption.strip())
                 caption = self.find_modes(caption_list)[0]
                 object['captions'] = [caption]
 
@@ -1067,7 +1069,7 @@ Object pair(s):
             score_1 = np.clip(1-(1-self.agent.prob_array_room)-(1-whether_near_room), 0, 10)
             score_2 = 1- np.clip(self.agent.prob_array_room+(1-whether_near_room), -10,1)
             scores[i] = np.sum(score_1) - np.sum(score_2)
-        for i in range(21):
+        for i in range(len(self.agent.obj_locations)):
             num_obj = len(self.agent.obj_locations[i])
             if num_obj <= 0:
                 continue

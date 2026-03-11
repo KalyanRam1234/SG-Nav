@@ -141,7 +141,11 @@ class SG_Nav_Agent():
         
         self.goal_idx = {}
         for key in projection:
-            self.goal_idx[projection[key]] = categories_21.index(projection[key])
+            self.goal_idx[projection[key]] = categories_21_origin.index(projection[key])
+        # Add extended categories that aren't in projection
+        for i, cat in enumerate(categories_21_origin):
+            if cat not in self.goal_idx:
+                self.goal_idx[cat] = i
         self.co_occur_mtx = np.load('tools/obj.npy')
         self.co_occur_mtx -= self.co_occur_mtx.min()
         self.co_occur_mtx /= self.co_occur_mtx.max() 
@@ -284,18 +288,13 @@ class SG_Nav_Agent():
               f"Goal: {self.obj_goal}")
         print(f"{'='*80}\n")
         self.current_obj_predictions = []
-        self.obj_locations = [[] for i in range(21)]
+        self.obj_locations = [[] for i in range(NUM_BASE_CATEGORIES)]
         self.not_move_steps = 0
         self.move_since_random = 0
         self.using_random_goal = False
         self.fronter_this_ex = 0
         self.random_this_ex = 0
         self.last_location = np.array([0.,0.])
-        self.current_stuck_steps = 0
-        self.total_stuck_steps = 0
-        self.explanation = ''
-        self.text_node = ''
-        self.text_edge = ''
         self.detected_objects_extended = set()
         self.escape_action_queue = []
         self.executing_escape = False
@@ -354,12 +353,10 @@ class SG_Nav_Agent():
         # need custom metrics for global scene graph
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
         self.current_obj_predictions = []
-        self.obj_locations = [[] for i in range(21)]
+        self.obj_locations = [[] for i in range(NUM_BASE_CATEGORIES)]
         self.not_move_steps = 0
         self.move_since_random = 0
         self.using_random_goal = False
-        # self.fronter_this_ex = 0
-        # self.random_this_ex = 0
         self.last_location = np.array([0.,0.])
         self.current_stuck_steps = 0
         self.total_stuck_steps = 0
