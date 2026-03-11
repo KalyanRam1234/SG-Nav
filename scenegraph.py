@@ -65,9 +65,12 @@ class GroupNode():
             self.edges.update(node.edges)
         self.caption = self.graph_to_text(self.nodes, self.edges)
 
-    def graph_to_text(self, nodes, edges):
+    def graph_to_text(self, nodes, edges, include_snapshots=False):
         nodes_text = ', '.join([node.caption for node in nodes])
-        edges_text = ', '.join([f"{edge.node1.caption} {edge.relation} {edge.node2.caption}" for edge in edges])
+        if include_snapshots:
+            edges_text = ', '.join([edge.text_with_snapshot() for edge in edges])
+        else:
+            edges_text = ', '.join([f"{edge.node1.caption} {edge.relation} {edge.node2.caption}" for edge in edges])
         return f"Nodes: {nodes_text}. Edges: {edges_text}."
 
 
@@ -130,15 +133,65 @@ class ObjectNode():
 
 
 class Edge():
+    SNAPSHOT_SIZE = (224, 224)
+
     def __init__(self, node1, node2):
         self.node1 = node1
         self.node2 = node2
         node1.add_edge(self)
         node2.add_edge(self)
         self.relation = None
+        # Memory snapshot fields (3D-Mem inspired)
+        self.snapshot_image = None       # np.ndarray thumbnail (H, W, 3) uint8
+        self.snapshot_frame_idx = None   # index into segment2d_results
+        self.snapshot_step = None        # navigate_steps when captured
+        self.snapshot_bboxes = None      # dict with 'node1': [x1,y1,x2,y2], 'node2': [x1,y1,x2,y2]
+        self.snapshot_clip_features = None  # np.ndarray (1, D) CLIP embedding of the snapshot
 
     def set_relation(self, relation):
         self.relation = relation
+
+    def set_snapshot(self, image, frame_idx=None, step=None, bboxes=None,
+                     clip_features=None):
+        """Store a memory snapshot on this edge.
+        
+        Args:
+            image: PIL.Image or np.ndarray — will be resized to SNAPSHOT_SIZE.
+            frame_idx: index into segment2d_results for provenance.
+            step: navigation step when the snapshot was taken.
+            bboxes: dict with 'node1' and 'node2' bounding boxes [x1,y1,x2,y2].
+            clip_features: optional pre-computed CLIP embedding (np.ndarray).
+        """
+        if isinstance(image, Image.Image):
+            thumb = image.resize(self.SNAPSHOT_SIZE, Image.LANCZOS)
+            self.snapshot_image = np.array(thumb, dtype=np.uint8)
+        elif isinstance(image, np.ndarray):
+            thumb = Image.fromarray(image).resize(self.SNAPSHOT_SIZE, Image.LANCZOS)
+            self.snapshot_image = np.array(thumb, dtype=np.uint8)
+        else:
+            self.snapshot_image = None
+        self.snapshot_frame_idx = frame_idx
+        self.snapshot_step = step
+        self.snapshot_bboxes = bboxes
+        if clip_features is not None:
+            self.snapshot_clip_features = np.array(clip_features) if not isinstance(clip_features, np.ndarray) else clip_features
+        else:
+            self.snapshot_clip_features = None
+
+    @property
+    def has_snapshot(self):
+        return self.snapshot_image is not None
+
+    def get_snapshot_pil(self):
+        """Return the snapshot as a PIL Image, or None."""
+        if self.snapshot_image is not None:
+            return Image.fromarray(self.snapshot_image)
+        return None
+
+    def clear_snapshot(self):
+        """Free snapshot memory while keeping relation metadata."""
+        self.snapshot_image = None
+        self.snapshot_clip_features = None
 
     def delete(self):
         self.node1.remove_edge(self)
@@ -148,9 +201,24 @@ class Edge():
         text = '({}, {}, {})'.format(self.node1.caption, self.node2.caption, self.relation)
         return text
 
+    def text_with_snapshot(self):
+        """Rich text including snapshot metadata for QA prompts."""
+        base = '({}, {}, {})'.format(self.node1.caption, self.node2.caption, self.relation)
+        if self.has_snapshot:
+            meta_parts = []
+            if self.snapshot_step is not None:
+                meta_parts.append(f"step={self.snapshot_step}")
+            if self.snapshot_frame_idx is not None:
+                meta_parts.append(f"frame={self.snapshot_frame_idx}")
+            if meta_parts:
+                base += ' [snapshot: {}]'.format(', '.join(meta_parts))
+            else:
+                base += ' [snapshot: available]'
+        return base
+
 
 class SceneGraph():
-    def __init__(self, map_resolution, map_size_cm, map_size, camera_matrix, is_navigation=True, agent=None) -> None:
+    def __init__(self, map_resolution, map_size_cm, map_size, camera_matrix, is_navigation=True, agent=None, is_global=False) -> None:
         self.map_resolution = map_resolution
         self.map_size_cm = map_size_cm
         self.map_size = map_size
@@ -175,6 +243,7 @@ class SceneGraph():
         self.init_room_nodes()
         self.reason_visualization = ''
         self.is_navigation = is_navigation
+        self.is_global = is_global
         self.llm_name = 'llama3.2-vision'
         self.vlm_name = 'llama3.2-vision'
         self.seg_xyxy = None
@@ -191,6 +260,7 @@ class SceneGraph():
             'lamp': 2, 'mirror': 2, 'rug': 2, 'curtain': 2, 'shelf': 2, 'desk': 2, 'door': 2, 'window': 2, 'pillow': 2, 'blanket': 2}
         self.small_objects = ['bathtub', 'chest_of_drawers', 'cushion', 'plant', 'seating', 'shower', 'toilet', 'tv_monitor',
             'lamp', 'mirror', 'pillow', 'blanket']
+        self.store_edge_snapshots = True  # set False to disable memory snapshots on edges
         self.found_goal_times_threshold = 1
         self.N_max = 10
         self.object_vocabulary = self._load_object_vocabulary('tools/object_vocabulary.txt')
@@ -287,7 +357,8 @@ Object pair(s):
     def set_obj_goal(self, obj_goal, obj_goal_sg):
         self.obj_goal = obj_goal
         self.obj_goal_sg = obj_goal_sg
-        if self.obj_goal in self.threshold_list:
+        # Global SG uses a fixed threshold to avoid node spikes on goal switches
+        if not self.is_global and self.obj_goal in self.threshold_list:
             self.cfg.obj_min_detections = self.threshold_list[self.obj_goal]
 
     def set_navigate_steps(self, navigate_steps):
@@ -326,6 +397,34 @@ Object pair(s):
             edges.update(node.edges)
         edges = list(edges)
         return edges
+
+    def get_edges_with_snapshots(self):
+        """Return only edges that have memory snapshots attached."""
+        return [e for e in self.get_edges() if e.has_snapshot]
+
+    def get_edge_snapshot_for_qa(self, obj1_caption, obj2_caption):
+        """Retrieve the snapshot image and metadata for a specific object pair.
+        
+        Useful for QA: given two object names, return the visual evidence
+        of their relationship.
+        
+        Returns:
+            dict with keys 'relation', 'snapshot_pil', 'step', 'frame_idx',
+            'bboxes', 'clip_features', or None if no matching edge found.
+        """
+        for edge in self.get_edges():
+            captions = {edge.node1.caption, edge.node2.caption}
+            if obj1_caption in captions and obj2_caption in captions:
+                result = {
+                    'relation': edge.relation,
+                    'snapshot_pil': edge.get_snapshot_pil(),
+                    'step': edge.snapshot_step,
+                    'frame_idx': edge.snapshot_frame_idx,
+                    'bboxes': edge.snapshot_bboxes,
+                    'clip_features': edge.snapshot_clip_features,
+                }
+                return result
+        return None
 
     def get_seg_xyxy(self):
         return self.seg_xyxy
@@ -756,12 +855,20 @@ Object pair(s):
             new_edges = new_edges | node_new_edges
         new_edges = list(new_edges)
         for new_edge in new_edges:
-            image = self.get_joint_image(new_edge.node1, new_edge.node2)
+            image, frame_idx, bboxes = self.get_joint_image(
+                new_edge.node1, new_edge.node2, return_metadata=True)
             if image is not None:
                 prompt = self.prompt_relation.format(new_edge.node1.caption, new_edge.node2.caption)
                 response = self.get_vlm_response(prompt=prompt, image=image)
                 response = response.replace('.', '').lower()
                 new_edge.set_relation(response)
+                # Capture memory snapshot
+                if self.store_edge_snapshots:
+                    step = getattr(self, 'navigate_steps', None)
+                    clip_feat = self._compute_snapshot_clip(image)
+                    new_edge.set_snapshot(
+                        image, frame_idx=frame_idx, step=step,
+                        bboxes=bboxes, clip_features=clip_feat)
         new_edges = set()
         for i, node in enumerate(self.nodes):
             node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
@@ -900,12 +1007,12 @@ Object pair(s):
             modes = [item for item, count in counts.items() if count == max_count]  
             return modes  
         
-    def get_joint_image(self, node1, node2):
+    def get_joint_image(self, node1, node2, return_metadata=False):
         image_idx1 = node1.object["image_idx"]
         image_idx2 = node2.object["image_idx"]
         image_idx = set(image_idx1) & set(image_idx2)
         if len(image_idx) == 0:
-            return None
+            return (None, None, None) if return_metadata else None
         conf_max = -np.inf
         idx_max = None
         # get joint images of the two nodes
@@ -922,10 +1029,35 @@ Object pair(s):
                 conf_max = conf
                 idx_max = idx
         if idx_max is None:
-            return None
+            return (None, None, None) if return_metadata else None
         image = self.segment2d_results[idx_max]["image_rgb"]
         image = Image.fromarray(image)
-        return image
+        if not return_metadata:
+            return image
+        # Collect per-node bounding boxes from this frame
+        bboxes = {}
+        seg = self.segment2d_results[idx_max]
+        for tag, node, img_idxs in [('node1', node1, image_idx1), ('node2', node2, image_idx2)]:
+            if idx_max in img_idxs:
+                det_pos = img_idxs.index(idx_max)
+                mask_pos = node.object["mask_idx"][det_pos]
+                if seg.get("xyxy") is not None and mask_pos < len(seg["xyxy"]):
+                    bboxes[tag] = seg["xyxy"][mask_pos].tolist()
+        return image, idx_max, bboxes
+
+    def _compute_snapshot_clip(self, image):
+        """Compute CLIP image features for an edge snapshot image."""
+        if not hasattr(self, 'clip_model') or self.clip_model is None:
+            return None
+        try:
+            pil_img = image if isinstance(image, Image.Image) else Image.fromarray(image)
+            inputs = self.clip_processor(images=pil_img, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                feat = self.clip_model.get_image_features(**inputs)
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+            return feat.cpu().numpy()
+        except Exception:
+            return None
 
     def score(self, frontier_locations_16, num_16_frontiers):
         scores = np.zeros((num_16_frontiers))
@@ -1098,11 +1230,22 @@ Object pair(s):
                 idx1 = node_to_idx.get(id(edge.node1))
                 idx2 = node_to_idx.get(id(edge.node2))
                 if idx1 is not None and idx2 is not None:
-                    s_edges.append({
+                    s_edge = {
                         'node1_idx': idx1,
                         'node2_idx': idx2,
                         'relation': edge.relation,
-                    })
+                    }
+                    # Serialize memory snapshot
+                    if edge.has_snapshot:
+                        buf = BytesIO()
+                        Image.fromarray(edge.snapshot_image).save(buf, format='JPEG', quality=85)
+                        s_edge['snapshot_b64'] = base64.b64encode(buf.getvalue()).decode('ascii')
+                        s_edge['snapshot_frame_idx'] = edge.snapshot_frame_idx
+                        s_edge['snapshot_step'] = edge.snapshot_step
+                        s_edge['snapshot_bboxes'] = edge.snapshot_bboxes
+                        if edge.snapshot_clip_features is not None:
+                            s_edge['snapshot_clip_features'] = edge.snapshot_clip_features.tolist()
+                    s_edges.append(s_edge)
 
         # Serialize group nodes (per room)
         s_groups = []
@@ -1126,10 +1269,16 @@ Object pair(s):
                 'exploration_level': rn.exploration_level,
             })
 
-        # Serialize objects_post
+        # Serialize objects_post (with node index for reliable back-reference restoration)
         s_objects_post = []
         for obj in self.objects_post:
-            s_objects_post.append(self._serialize_object_dict(obj))
+            s_obj = self._serialize_object_dict(obj)
+            node_ref = obj.get('node')
+            if node_ref is not None and id(node_ref) in node_to_idx:
+                s_obj['_node_idx'] = node_to_idx[id(node_ref)]
+            else:
+                s_obj['_node_idx'] = None
+            s_objects_post.append(s_obj)
 
         return {
             'nodes': s_nodes,
@@ -1185,18 +1334,37 @@ Object pair(s):
             n2 = self.nodes[s_edge['node2_idx']]
             edge = Edge(n1, n2)  # auto-adds to both nodes
             edge.set_relation(s_edge['relation'])
+            # Restore memory snapshot
+            if 'snapshot_b64' in s_edge:
+                img_bytes = base64.b64decode(s_edge['snapshot_b64'])
+                pil_img = Image.open(BytesIO(img_bytes))
+                clip_feat = None
+                if 'snapshot_clip_features' in s_edge:
+                    clip_feat = np.array(s_edge['snapshot_clip_features'])
+                edge.set_snapshot(
+                    pil_img,
+                    frame_idx=s_edge.get('snapshot_frame_idx'),
+                    step=s_edge.get('snapshot_step'),
+                    bboxes=s_edge.get('snapshot_bboxes'),
+                    clip_features=clip_feat,
+                )
             self.edge_list.append(edge)
 
         # Restore objects_post
         self.objects_post = MapObjectList(device=self.device)
         for s_obj in data['objects_post']:
             obj = self._deserialize_object_dict(s_obj)
-            # Link back to node if applicable
-            for node in self.nodes:
-                if node.object is not None and node.object.get('class_name') == obj.get('class_name'):
-                    if node.center == obj.get('center', None):
-                        obj['node'] = node
-                        break
+            # Link back to node using stored index (reliable) or fallback to class/center match
+            node_idx = s_obj.get('_node_idx')
+            if node_idx is not None and 0 <= node_idx < len(self.nodes):
+                obj['node'] = self.nodes[node_idx]
+            else:
+                # Fallback for data serialized before _node_idx was added
+                for node in self.nodes:
+                    if node.object is not None and node.object.get('class_name') == obj.get('class_name'):
+                        if node.center == obj.get('center', None):
+                            obj['node'] = node
+                            break
             self.objects_post.append(obj)
 
         # Restore visited and num_of_goal

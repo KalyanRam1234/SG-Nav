@@ -247,7 +247,8 @@ def build_pyvis_network(data, title="Scene Graph"):
             )
 
     # --- Spatial relation edges ---
-    for edge in edges:
+    edge_snapshots = {}  # edge_id -> base64 image data
+    for ei, edge in enumerate(edges):
         n1 = edge.get('node1_idx')
         n2 = edge.get('node2_idx')
         relation = edge.get('relation', '')
@@ -256,15 +257,37 @@ def build_pyvis_network(data, title="Scene Graph"):
         if n1 >= len(nodes) or n2 >= len(nodes):
             continue
 
+        caption1 = nodes[n1].get('caption', '?')
+        caption2 = nodes[n2].get('caption', '?')
+        has_snap = 'snapshot_b64' in edge
+
+        title_parts = [f"{caption1} —{relation}— {caption2}"]
+        if has_snap:
+            title_parts.append(f"Step: {edge.get('snapshot_step', '?')}")
+            title_parts.append("📷 Click to view snapshot")
+
+        edge_id = f"{n1}-{n2}"
+        if has_snap:
+            edge_snapshots[edge_id] = {
+                'b64': edge['snapshot_b64'],
+                'caption1': caption1,
+                'caption2': caption2,
+                'relation': relation,
+                'step': edge.get('snapshot_step', '?'),
+            }
+
         net.add_edge(
             n1,
             n2,
             label=relation if relation else "",
-            title=f"{nodes[n1].get('caption','?')} —{relation}— {nodes[n2].get('caption','?')}",
-            color="#AAAAAA",
-            width=2,
+            title="\n".join(title_parts),
+            color="#00FF88" if has_snap else "#AAAAAA",
+            width=3 if has_snap else 2,
             font={"size": 10, "color": "#CCCCCC", "align": "middle"},
         )
+
+    # Store snapshot data for injection into HTML
+    net._edge_snapshots = edge_snapshots
 
     return net
 
@@ -303,12 +326,95 @@ def visualize_scenegraph(scenegraph_or_path, output_path="scene_graph.html", tit
                    if any(n.get('room_idx') == i for n in sg.get('nodes', []))])
 
     n_groups = len(sg.get('group_nodes', []))
+    n_snapshots = len(getattr(net, '_edge_snapshots', {}))
 
     output_path = str(output_path)
     net.show(output_path, notebook=False)
+
+    # Inject snapshot modal viewer into the generated HTML
+    edge_snapshots = getattr(net, '_edge_snapshots', {})
+    if edge_snapshots:
+        _inject_snapshot_viewer(output_path, edge_snapshots)
+
     print(f"Scene graph visualization saved to: {output_path}")
     print(f"  Nodes: {n_nodes}, Edges: {n_edges}, Groups: {n_groups}, Active rooms: {n_rooms}")
+    if n_snapshots:
+        print(f"  Edge snapshots: {n_snapshots} (green edges — click to view)")
     return output_path
+
+
+def _inject_snapshot_viewer(html_path, edge_snapshots):
+    """Inject CSS/JS into the pyvis HTML to show snapshot images on edge click."""
+    import json
+
+    snapshot_json = json.dumps({
+        k: {'b64': v['b64'], 'caption1': v['caption1'], 'caption2': v['caption2'],
+             'relation': v['relation'], 'step': v['step']}
+        for k, v in edge_snapshots.items()
+    })
+
+    injection = f"""
+<!-- Snapshot Modal Viewer -->
+<style>
+#snapshotOverlay {{
+    display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.85); z-index: 9999; justify-content: center; align-items: center;
+    flex-direction: column; cursor: pointer;
+}}
+#snapshotOverlay.active {{ display: flex; }}
+#snapshotOverlay img {{
+    max-width: 80%; max-height: 70%; border: 3px solid #00FF88; border-radius: 8px;
+    box-shadow: 0 0 40px rgba(0,255,136,0.3);
+}}
+#snapshotCaption {{
+    color: #fff; font-family: monospace; font-size: 16px; margin-top: 16px;
+    text-align: center; max-width: 80%;
+}}
+#snapshotHint {{
+    color: #888; font-family: monospace; font-size: 12px; margin-top: 8px;
+}}
+</style>
+<div id="snapshotOverlay" onclick="this.classList.remove('active')">
+    <img id="snapshotImg" src="" />
+    <div id="snapshotCaption"></div>
+    <div id="snapshotHint">Click anywhere to close</div>
+</div>
+<script>
+var edgeSnapshots = {snapshot_json};
+// Wait for vis.js network to be ready
+var _waitNet = setInterval(function() {{
+    if (typeof network !== 'undefined') {{
+        clearInterval(_waitNet);
+        network.on("selectEdge", function(params) {{
+            if (params.edges.length === 0) return;
+            var edgeId = params.edges[0];
+            var edgeData = network.body.data.edges.get(edgeId);
+            if (!edgeData) return;
+            var key = edgeData.from + "-" + edgeData.to;
+            var snap = edgeSnapshots[key];
+            if (!snap) {{
+                // Try reverse direction
+                key = edgeData.to + "-" + edgeData.from;
+                snap = edgeSnapshots[key];
+            }}
+            if (snap) {{
+                document.getElementById('snapshotImg').src = 'data:image/jpeg;base64,' + snap.b64;
+                document.getElementById('snapshotCaption').textContent =
+                    snap.caption1 + ' \\u2014' + snap.relation + '\\u2014 ' + snap.caption2 +
+                    '  (step ' + snap.step + ')';
+                document.getElementById('snapshotOverlay').classList.add('active');
+            }}
+        }});
+    }}
+}}, 200);
+</script>
+"""
+
+    with open(html_path, 'r') as f:
+        html = f.read()
+    html = html.replace('</body>', injection + '\n</body>')
+    with open(html_path, 'w') as f:
+        f.write(html)
 
 
 def main():

@@ -153,7 +153,7 @@ class SG_Nav_Agent():
         self.scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self)
 
         # Need Separate global variables
-        self.global_scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self)
+        self.global_scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self, is_global=True)
 
         self.target_objects_list = [
             'chair', 'table', 'sofa', 'cabinet', 'plant', 'lamp', 'picture', 'shower',
@@ -275,6 +275,14 @@ class SG_Nav_Agent():
             self.obj_goal_sg = 'drawers'
         elif self.obj_goal == 'tv_monitor':
             self.obj_goal_sg = 'tv'
+
+        episode = self.simulator._env.current_episode
+        total_episodes = len(self.simulator._env.episodes)
+        print(f"\n{'='*80}")
+        print(f"[Episode Reset] Episode {self.count_episodes}/{total_episodes} | "
+              f"ID: {episode.episode_id} | Scene: {episode.scene_id.split('/')[-2]} | "
+              f"Goal: {self.obj_goal}")
+        print(f"{'='*80}\n")
         self.current_obj_predictions = []
         self.obj_locations = [[] for i in range(21)]
         self.not_move_steps = 0
@@ -599,8 +607,11 @@ class SG_Nav_Agent():
         
         edges = self.global_scenegraph.get_edges()
         if edges:
-            edge_texts = [f"{e.node1.caption} {e.relation} {e.node2.caption}" for e in edges[:20]]
+            edge_texts = [e.text_with_snapshot() for e in edges[:20]]
             lines.append(f"Spatial relationships: {'; '.join(edge_texts)}")
+            snapshot_count = sum(1 for e in edges if e.has_snapshot)
+            if snapshot_count > 0:
+                lines.append(f"({snapshot_count}/{len(edges)} edges have memory snapshots)")
         
         # 4. Spatial map summary
         lines.append(f"\n=== SPATIAL MAP ===")
@@ -765,6 +776,8 @@ class SG_Nav_Agent():
                 self.save_global_scenegraph(tag="episode_complete")
                 return {"action": 0}
         
+        print(f"\n[Episode info] total_episodes = {len(self.simulator._env.episodes)}|")
+
         self.total_steps += 1
         self.exploration_total_steps +=1
 
@@ -1648,8 +1661,12 @@ class SG_Nav_Agent():
         self.metrics['distance_to_goal'] = metrics['distance_to_goal']
         self.metrics['spl'] = metrics['spl']
         self.metrics['softspl'] = metrics['softspl']
+        if self.simulator._env.episode_over:
+            print(f"\n[Episode Over] Episode {self.count_episodes} ended at step {self.total_steps} | "
+                  f"Goal: {self.obj_goal} | DTG: {metrics['distance_to_goal']:.2f} | "
+                  f"SPL: {metrics['spl']:.3f} | Success: {metrics.get('success', 'N/A')}")
         if self.args.visualize:
-            if self.simulator._env.episode_over or self.total_steps == 300:
+            if self.simulator._env.episode_over or self.total_steps == 5000:
                 self.save_video()
                 self.save_global_scenegraph(tag="episode_end")
 
