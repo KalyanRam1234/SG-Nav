@@ -111,6 +111,8 @@ class SG_Nav_Agent():
         self.collision_threshold = 0.08
         self.selem = skimage.morphology.square(1)
         self.explanation = ''
+        self.text_node = ''
+        self.text_edge = ''
         self.sem_map_module = Semantic_Mapping(self).to(self.device) 
         self.free_map_module = Semantic_Mapping(self, max_height=10,min_height=-150).to(self.device)
         self.room_map_module = Semantic_Mapping(self, max_height=200,min_height=-10, num_cats=9).to(self.device)
@@ -271,6 +273,9 @@ class SG_Nav_Agent():
         self.loop_time = 0
         self.last_segment_num = 0
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
+        self.explanation = ''
+        self.text_node = ''
+        self.text_edge = ''
         self.obj_goal = self.simulator._env.current_episode.object_category
         self.obj_goal_sg = self.simulator._env.current_episode.object_category
         if self.obj_goal == 'gym_equipment':
@@ -1868,7 +1873,7 @@ def _get_free_and_total_gpu_memory():
     return free_mb * 1024**2, total_mb * 1024**2
 
 
-def _reserve_gpu_memory(reserve_gb=20):
+def _reserve_gpu_memory(reserve_gb=15):
     """Pre-reserve GPU memory so other processes can't claim it.
     PyTorch's caching allocator keeps the memory even after the tensor is freed."""
     if torch.cuda.is_available():
@@ -1905,7 +1910,7 @@ def main():
         help="Enable teleporting to saved frontiers when stuck with no new frontiers"
     )
     parser.add_argument(
-        "--reserve_gpu_gb", default=25, type=float,
+        "--reserve_gpu_gb", default=15, type=float,
         help="Pre-reserve GPU memory in GB to prevent other processes from claiming it"
     )
     args = parser.parse_args()

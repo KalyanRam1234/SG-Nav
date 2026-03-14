@@ -23,21 +23,22 @@ with open('tools/matterport_category_mappings.tsv') as file:
         if line_[-1] not in categories_40 and line_[-1] is not 'objects' and 'void' not in line_[-1]:
             categories_40.append(line_[-1])
 
-# this is important for later evaluation
-categories_21 = ['chair', 'table', 'picture', 'cabinet', 'cushion', 'sofa',
-'bed', 'chest_of_drawers', 'plant', 'sink', 'toilet', 'stool',
-'towel', 'tv_monitor', 'shower', 'bathtub', 'counter', 'fireplace', 'gym_equipment', 'seating', 'clothes']
-
-categories_21_origin = copy.deepcopy(categories_21)
-
-# Extended categories for scene graph (includes objects beyond ObjectNav 21)
-categories_extended = copy.deepcopy(categories_21_origin) + [
+# Base categories: original 21 ObjectNav + 10 extended scene-graph categories
+categories_21 = [
+    'chair', 'table', 'picture', 'cabinet', 'cushion', 'sofa',
+    'bed', 'chest_of_drawers', 'plant', 'sink', 'toilet', 'stool',
+    'towel', 'tv_monitor', 'shower', 'bathtub', 'counter', 'fireplace',
+    'gym_equipment', 'seating', 'clothes',
     'lamp', 'mirror', 'rug', 'curtain', 'shelf', 'desk',
     'door', 'window', 'pillow', 'blanket'
 ]
+NUM_BASE_CATEGORIES = len(categories_21)  # 31
 
+categories_21_origin = copy.deepcopy(categories_21)
+categories_extended = copy.deepcopy(categories_21)
+
+# Extra GLIP detection targets (not indexed in co-occurrence matrices)
 categories_21.append('heater')
-categories_21.append('window')
 categories_21.append('treadmill')
 categories_21.append('exercise machine')
 object_captions = '. '.join(categories_21) +'.'# version 1
