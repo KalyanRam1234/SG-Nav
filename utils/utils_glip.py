@@ -20,7 +20,7 @@ with open('tools/matterport_category_mappings.tsv') as file:
             else:
                 categories.append(line_[2])
                 categories_map[line_[2]] = line_[-1]
-        if line_[-1] not in categories_40 and line_[-1] is not 'objects' and 'void' not in line_[-1]:
+        if line_[-1] not in categories_40 and line_[-1] != 'objects' and 'void' not in line_[-1]:
             categories_40.append(line_[-1])
 
 # Base categories: original 21 ObjectNav + 10 extended scene-graph categories
@@ -30,17 +30,18 @@ categories_21 = [
     'towel', 'tv_monitor', 'shower', 'bathtub', 'counter', 'fireplace',
     'gym_equipment', 'seating', 'clothes',
     'lamp', 'mirror', 'rug', 'curtain', 'shelf', 'desk',
-    'door', 'window', 'pillow', 'blanket'
+    'door', 'window', 'cushion pillow', 'blanket', 'cup'
 ]
 NUM_BASE_CATEGORIES = len(categories_21)  # 31
-
-categories_21_origin = copy.deepcopy(categories_21)
-categories_extended = copy.deepcopy(categories_21)
 
 # Extra GLIP detection targets (not indexed in co-occurrence matrices)
 categories_21.append('heater')
 categories_21.append('treadmill')
 categories_21.append('exercise machine')
+
+categories_21_origin = copy.deepcopy(categories_21)
+categories_extended = copy.deepcopy(categories_21)
+
 object_captions = '. '.join(categories_21) +'.'# version 1
 rooms = ['bedroom', 'living room', 'bathroom', 'kitchen', 'dining room', 'office room', 'gym', 'lounge', 'laundry room']
 rooms_captions = '. '.join(rooms)+'.'

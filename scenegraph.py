@@ -1,6 +1,7 @@
 import base64
 import math
 import os
+import re
 from collections import Counter
 from io import BytesIO
 from pathlib import Path, PosixPath
@@ -264,6 +265,9 @@ class SceneGraph():
         self.found_goal_times_threshold = 1
         self.N_max = 10
         self.object_vocabulary = self._load_object_vocabulary('tools/object_vocabulary.txt')
+        self._vocab_list = [v.strip().lower() for v in self.object_vocabulary]
+        self._vocab_set = set(self._vocab_list)
+        self._clip_text_cache = {}
         self.node_space = '. '.join(self.object_vocabulary) + '.'
         print(f"[SceneGraph] Loaded {len(self.object_vocabulary)} objects for detection: {self.node_space}")
         self.prompt_edge_proposal = '''
@@ -323,6 +327,55 @@ Object pair(s):
                        'sink', 'sofa', 'stool', 'table', 'toilet', 'towel', 'tv', 'treadmill',
                        'fitness equipment']
         return objects
+
+    def _normalize_caption_text(self, caption):
+        caption = caption.lower().strip().replace('_', ' ')
+        caption = re.sub(r'[^a-z0-9 ]+', ' ', caption)
+        return ' '.join(caption.split())
+
+    def _extract_caption_candidates(self, caption):
+        cleaned = self._normalize_caption_text(caption)
+        if not cleaned:
+            return []
+        if cleaned in self._vocab_set:
+            return [cleaned]
+        padded = f" {cleaned} "
+        candidates = [v for v in self._vocab_list if f" {v} " in padded]
+        if candidates:
+            seen = set()
+            ordered = []
+            for item in sorted(candidates, key=len, reverse=True):
+                if item not in seen:
+                    seen.add(item)
+                    ordered.append(item)
+            return ordered
+        return [cleaned]
+
+    def _get_text_features_cached(self, labels):
+        missing = [label for label in labels if label not in self._clip_text_cache]
+        if missing:
+            inputs = self.clip_processor(text=missing, return_tensors="pt", padding=True).to(self.device)
+            with torch.no_grad():
+                feats = self.clip_model.get_text_features(**inputs)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            for label, feat in zip(missing, feats):
+                self._clip_text_cache[label] = feat
+        return torch.stack([self._clip_text_cache[label] for label in labels], dim=0)
+
+    def _select_caption_for_detection(self, raw_caption, image_feat):
+        candidates = self._extract_caption_candidates(raw_caption)
+        if not candidates:
+            return self._normalize_caption_text(raw_caption)
+        if len(candidates) == 1 or image_feat is None:
+            return candidates[0]
+        image_tensor = torch.as_tensor(image_feat, device=self.device, dtype=torch.float32)
+        if image_tensor.ndim == 2 and image_tensor.shape[0] == 1:
+            image_tensor = image_tensor.squeeze(0)
+        image_tensor = image_tensor / image_tensor.norm(dim=-1, keepdim=True)
+        text_feats = self._get_text_features_cached(candidates)
+        sims = torch.mv(text_feats, image_tensor)
+        best_idx = int(torch.argmax(sims).item())
+        return candidates[best_idx]
 
     def reset(self):
         full_w, full_h = self.map_size, self.map_size
@@ -777,10 +830,14 @@ Object pair(s):
             for idx, object in enumerate(self.objects_post):
                 caption_list = []
                 for idx_det in range(len(object["image_idx"])):
-                    caption = self.segment2d_results[object["image_idx"][idx_det]]['caption'][object["mask_idx"][idx_det]]
-                    # Treat the full phrase as one entry (don't split multi-word
-                    # captions like "fitness equipment" into individual words)
-                    caption_list.append(caption.strip())
+                    image_idx = object["image_idx"][idx_det]
+                    mask_idx = object["mask_idx"][idx_det]
+                    entry = self.segment2d_results[image_idx]
+                    caption = entry['caption'][mask_idx]
+                    image_feats = entry.get('image_feats')
+                    image_feat = image_feats[mask_idx] if image_feats is not None else None
+                    caption = self._select_caption_for_detection(caption, image_feat)
+                    caption_list.append(caption)
                 caption = self.find_modes(caption_list)[0]
                 object['captions'] = [caption]
 

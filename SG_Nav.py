@@ -151,6 +151,7 @@ class SG_Nav_Agent():
         self.co_occur_mtx = np.load('tools/obj.npy')
         self.co_occur_mtx -= self.co_occur_mtx.min()
         self.co_occur_mtx /= self.co_occur_mtx.max() 
+        self.num_cooccur_objects = int(self.co_occur_mtx.shape[0])
         
         self.co_occur_room_mtx = np.load('tools/room.npy')
         self.co_occur_room_mtx -= self.co_occur_room_mtx.min()
@@ -293,7 +294,7 @@ class SG_Nav_Agent():
               f"Goal: {self.obj_goal}")
         print(f"{'='*80}\n")
         self.current_obj_predictions = []
-        self.obj_locations = [[] for i in range(NUM_BASE_CATEGORIES)]
+        self.obj_locations = [[] for i in range(self.num_cooccur_objects)]
         self.not_move_steps = 0
         self.move_since_random = 0
         self.using_random_goal = False
@@ -358,7 +359,7 @@ class SG_Nav_Agent():
         # need custom metrics for global scene graph
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
         self.current_obj_predictions = []
-        self.obj_locations = [[] for i in range(NUM_BASE_CATEGORIES)]
+        self.obj_locations = [[] for i in range(self.num_cooccur_objects)]
         self.not_move_steps = 0
         self.move_since_random = 0
         self.using_random_goal = False
@@ -418,7 +419,11 @@ class SG_Nav_Agent():
                 obj_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
                 x = int(self.map_size_cm/10-obj_gps[1]*100/self.resolution)
                 y = int(self.map_size_cm/10+obj_gps[0]*100/self.resolution)
-                self.obj_locations[categories_21_origin.index(label)].append([confidence, x, y])
+                idx = categories_21_origin.index(label)
+                if idx < self.num_cooccur_objects:
+                    self.obj_locations[idx].append([confidence, x, y])
+                else:
+                    self.detected_objects_extended.add(label)
             elif label in categories_extended:
                 # Track extended category detections for richer scene graph
                 confidence = self.current_obj_predictions.get_field("scores")[j]
@@ -1700,10 +1705,16 @@ class SG_Nav_Agent():
             'global_origins': self.global_origins.copy(),
         }
 
+        episode = getattr(self.simulator._env, 'current_episode', None)
         save_data = {
             'scenegraph': sg_data,
             'maps': maps_data,
+            # Episode metadata (useful for DynamicQA manifest alignment)
+            'scene_id': getattr(episode, 'scene_id', None),
+            'episode_id': getattr(episode, 'episode_id', None),
+            # Backwards-compatible key (older pickles used 'episode')
             'episode': getattr(self, 'episode_n', None),
+            'episode_n': getattr(self, 'episode_n', None),
             'target_object_idx': self.target_object_idx,
             'found_objects': self.found_objects,
             'total_steps': self.total_steps,
