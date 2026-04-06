@@ -42,6 +42,7 @@ class ChangeType(str, Enum):
     REPLACED = "REPLACED"
     ADDED = "ADDED"
     REMOVED = "REMOVED"
+    UNSEEN = "UNSEEN"
     UNCERTAIN = "UNCERTAIN"
 
 
@@ -104,6 +105,85 @@ class MatchReport:
     unmatched: list
     edge_consistency_global: float
     summary: dict
+
+
+# ---------------------------------------------------------------------------
+# Spatial utilities
+# ---------------------------------------------------------------------------
+
+MAP_RESOLUTION = 0.05   # meters per pixel (SG-Nav default)
+MAP_SIZE = 800           # grid dimension
+
+def _3d_to_grid(centroid_3d: np.ndarray) -> Tuple[int, int]:
+    """Convert 3D world coords to (col, row) in the 800×800 grid."""
+    col = int(round(centroid_3d[0] / MAP_RESOLUTION))
+    row = int(round(MAP_SIZE - centroid_3d[1] / MAP_RESOLUTION))
+    return col, row
+
+
+def compute_auto_scene_scale(feats_1: list, feats_2: list) -> float:
+    """Compute scene_scale from the union bounding box of both graphs.
+
+    Returns the max spatial extent (in meters) across X/Y/Z.
+    Falls back to 20.0 if insufficient data.
+    """
+    all_centroids = []
+    for f in feats_1:
+        all_centroids.append(f.centroid_3d)
+    for f in feats_2:
+        all_centroids.append(f.centroid_3d)
+    if len(all_centroids) < 2:
+        return 20.0
+    pts = np.array(all_centroids)
+    extents = pts.max(axis=0) - pts.min(axis=0)
+    scale = float(extents.max())
+    return max(scale, 1.0)
+
+
+def build_explored_mask(maps: dict, sensor_range_m: float = 5.0) -> Optional[np.ndarray]:
+    """Build a boolean mask of explored/observable cells from maps data.
+
+    Combines the visited map and free-space map, then expands by the
+    sensor range so that objects visible *from* visited cells are covered.
+    Returns an (800, 800) boolean array, or None if maps unavailable.
+    """
+    visited = maps.get('global_visited')
+    free_map = maps.get('global_fbe_free_map')
+
+    if visited is None:
+        return None
+
+    visited_2d = np.asarray(visited).squeeze()
+    if visited_2d.ndim != 2:
+        return None
+
+    # Combine: a cell is "observable" if it was visited OR detected as free
+    observable = visited_2d > 0
+    if free_map is not None:
+        free_2d = np.asarray(free_map).squeeze()
+        if free_2d.ndim == 2 and free_2d.shape == observable.shape:
+            observable = observable | (free_2d > 0)
+
+    # Expand by sensor range using distance transform (fast, O(n))
+    dilation_px = int(sensor_range_m / MAP_RESOLUTION)
+    if dilation_px > 0:
+        from scipy.ndimage import distance_transform_edt
+        # distance_transform gives distance from each False cell to nearest True
+        dist = distance_transform_edt(~observable)
+        observable = dist <= dilation_px
+
+    return observable
+
+
+def is_in_explored_area(centroid_3d: np.ndarray,
+                        explored_mask: Optional[np.ndarray]) -> bool:
+    """Check whether a 3D point falls within an explored/observable region."""
+    if explored_mask is None:
+        return True  # no map → assume explored (conservative)
+    col, row = _3d_to_grid(centroid_3d)
+    if 0 <= row < explored_mask.shape[0] and 0 <= col < explored_mask.shape[1]:
+        return bool(explored_mask[row, col])
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +368,14 @@ def spatial_cost(a: NodeFeatures, b: NodeFeatures,
                  scene_scale: float = 5.0) -> float:
     """Gaussian spatial cost — sharp falloff penalizes distant matches.
 
-    Uses 1 - exp(-d²/2σ²) with σ = scene_scale/2.5 so that:
-      1m → ~0.05,  2m → ~0.18,  3m → ~0.36,  5m → ~0.71,  8m → ~0.96
+    Uses 1 - exp(-d²/2σ²) with σ capped so that:
+    - Within ~2m is cheap (true matches with SLAM drift)
+    - Beyond ~5m is expensive (likely wrong matches)
+    Sigma is min(scene_scale/2.5, 4.0) to prevent the curve from flattening
+    too much on large scenes.
     """
     dist = float(np.linalg.norm(a.centroid_3d - b.centroid_3d))
-    sigma = scene_scale / 2.5
+    sigma = min(scene_scale / 2.5, 4.0)
     return 1.0 - float(np.exp(-(dist ** 2) / (2 * sigma ** 2)))
 
 
@@ -358,19 +441,40 @@ def shape_cost(a: NodeFeatures, b: NodeFeatures) -> float:
 class MatchWeights:
     """Weights for combining cost components.
 
-    Rebalanced for instance-level discrimination.  Color histogram is
-    the strongest same-category discriminator (gap=0.229 vs CLIP's 0.066).
+    Two presets available via `MatchWeights.preset()`:
+      - "static"  — spatial position is primary signal (objects don't move)
+      - "dynamic" — identity (appearance) is primary signal (objects may move)
     """
-    w_spatial: float = 0.30       # primary geometric signal
-    w_color: float = 0.20         # HSV histogram — strongest instance signal
-    w_clip_visual: float = 0.14   # useful cross-category, weak intra-category
-    w_snapshot: float = 0.10      # edge context
-    w_label: float = 0.08         # coarse category filter
-    w_shape: float = 0.08         # PCA geometry
-    w_clip_text: float = 0.05     # semantic backup
-    w_room: float = 0.05          # room hierarchy
+    w_spatial: float = 0.30
+    w_color: float = 0.20
+    w_clip_visual: float = 0.14
+    w_snapshot: float = 0.10
+    w_label: float = 0.08
+    w_shape: float = 0.08
+    w_clip_text: float = 0.05
+    w_room: float = 0.05
     unmatched_cost: float = 0.42
     scene_scale: float = 5.0
+
+    @staticmethod
+    def preset(mode: str) -> 'MatchWeights':
+        if mode == "static":
+            # Position-dependent: 35%, Identity-based: 65%
+            return MatchWeights(
+                w_spatial=0.30, w_color=0.20, w_clip_visual=0.14,
+                w_snapshot=0.10, w_label=0.08, w_shape=0.08,
+                w_clip_text=0.05, w_room=0.05,
+                unmatched_cost=0.42)
+        elif mode == "dynamic":
+            # Position-dependent: 10%, Identity-based: 90%
+            # Color histogram is the strongest instance discriminator
+            return MatchWeights(
+                w_spatial=0.08, w_color=0.28, w_clip_visual=0.18,
+                w_snapshot=0.14, w_label=0.10, w_shape=0.10,
+                w_clip_text=0.07, w_room=0.05,
+                unmatched_cost=0.38)
+        else:
+            raise ValueError(f"Unknown mode: {mode!r}. Use 'static' or 'dynamic'.")
 
 
 def build_cost_matrix(feats_1: list, feats_2: list,
@@ -396,7 +500,7 @@ def build_cost_matrix(feats_1: list, feats_2: list,
     print(f"[{_ts()}] Building cost matrix ({n1} x {n2} = {total_cells:,} cells) ...")
 
     for i, fa in enumerate(feats_1):
-        if i % report_interval == 0 and i > 0:
+        if report_interval >= 5 and i % report_interval == 0 and i > 0:
             elapsed = time.time() - t0
             pct = 100 * i / n1
             eta = elapsed / i * (n1 - i)
@@ -566,14 +670,18 @@ def classify_match(fa: NodeFeatures, fb: NodeFeatures,
 # Main matching pipeline
 # ---------------------------------------------------------------------------
 
-def load_scene_graph(filepath: str) -> dict:
-    """Load a scene graph from a .pkl file."""
+def load_scene_graph(filepath: str) -> Tuple[dict, dict]:
+    """Load a scene graph and maps from a .pkl file.
+
+    Returns (scenegraph_dict, maps_dict).
+    """
     print(f"[{_ts()}] Loading {filepath.split('/')[-1]} ...")
     with open(filepath, 'rb') as f:
         save_data = pickle.load(f)
     sg = save_data['scenegraph']
+    maps = save_data.get('maps', {})
     print(f"[{_ts()}]   -> {len(sg['nodes'])} nodes, {len(sg['edges'])} edges")
-    return sg
+    return sg, maps
 
 
 def match_scene_graphs(sg1_path: str, sg2_path: str,
@@ -586,14 +694,32 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
     if thresholds is None:
         thresholds = ChangeThresholds()
 
-    sg1_data = load_scene_graph(sg1_path)
-    sg2_data = load_scene_graph(sg2_path)
+    sg1_data, maps1 = load_scene_graph(sg1_path)
+    sg2_data, maps2 = load_scene_graph(sg2_path)
 
     feats_1 = extract_node_features(sg1_data, label="SG1")
     feats_2 = extract_node_features(sg2_data, label="SG2")
 
     snaps_1 = build_node_edge_snapshots(sg1_data, label="SG1")
     snaps_2 = build_node_edge_snapshots(sg2_data, label="SG2")
+
+    # Auto-compute scene_scale if not overridden
+    auto_scale = compute_auto_scene_scale(feats_1, feats_2)
+    if weights.scene_scale <= 0:
+        weights.scene_scale = auto_scale
+    print(f"[{_ts()}] Scene scale: {weights.scene_scale:.1f}m "
+          f"(auto={auto_scale:.1f}m)")
+
+    # Build explored masks for UNSEEN detection
+    print(f"[{_ts()}] Building exploration coverage masks ...")
+    explored_mask_1 = build_explored_mask(maps1)
+    explored_mask_2 = build_explored_mask(maps2)
+    if explored_mask_1 is not None:
+        pct1 = 100 * np.count_nonzero(explored_mask_1) / explored_mask_1.size
+        print(f"[{_ts()}]   SG1 explored: {pct1:.1f}% of grid")
+    if explored_mask_2 is not None:
+        pct2 = 100 * np.count_nonzero(explored_mask_2) / explored_mask_2.size
+        print(f"[{_ts()}]   SG2 explored: {pct2:.1f}% of grid")
 
     n1, n2 = len(feats_1), len(feats_2)
 
@@ -676,20 +802,31 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
                   f"{clip_sim:6.3f} {chist_sim:5.3f} {dist_3d:6.2f}m "
                   f"{change_type.value:>10s} {confidence:5.3f}")
 
-    # Unmatched nodes
+    # Unmatched nodes — distinguish UNSEEN (not explored) from REMOVED/ADDED
+    print(f"[{_ts()}] Classifying unmatched nodes (REMOVED/UNSEEN/ADDED) ...")
     unmatched = []
     for i, f in enumerate(feats_1):
         if i not in matched_sg1:
+            # Was this SG1 node's location explored by SG2?
+            if is_in_explored_area(f.centroid_3d, explored_mask_2):
+                ctype = ChangeType.REMOVED  # SG2 explored here but didn't see it
+            else:
+                ctype = ChangeType.UNSEEN   # SG2 never explored this area
             unmatched.append(asdict(UnmatchedNode(
                 sg_source="sg1", node_idx=f.idx, caption=f.caption,
-                change_type=ChangeType.REMOVED.value,
+                change_type=ctype.value,
                 centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx)))
 
     for j, f in enumerate(feats_2):
         if j not in matched_sg2:
+            # Was this SG2 node's location explored by SG1?
+            if is_in_explored_area(f.centroid_3d, explored_mask_1):
+                ctype = ChangeType.ADDED    # SG1 explored here but didn't see it
+            else:
+                ctype = ChangeType.UNSEEN   # SG1 never explored this area
             unmatched.append(asdict(UnmatchedNode(
                 sg_source="sg2", node_idx=f.idx, caption=f.caption,
-                change_type=ChangeType.ADDED.value,
+                change_type=ctype.value,
                 centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx)))
 
     # Edge consistency — computed on accepted matches only (post-classification)
@@ -715,10 +852,8 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
     summary = {t.value: 0 for t in ChangeType}
     for m in matches:
         summary[m['change_type']] += 1
-    summary[ChangeType.ADDED.value] = sum(
-        1 for u in unmatched if u['change_type'] == ChangeType.ADDED.value)
-    summary[ChangeType.REMOVED.value] = sum(
-        1 for u in unmatched if u['change_type'] == ChangeType.REMOVED.value)
+    for u in unmatched:
+        summary[u['change_type']] += 1
 
     report = MatchReport(
         sg1_path=sg1_path, sg2_path=sg2_path,
@@ -755,17 +890,23 @@ def main():
                         help='Output JSON path (default: stdout summary)')
     parser.add_argument('--verbose', '-v', action='store_true')
 
-    # Weight overrides
-    parser.add_argument('--w-spatial', type=float, default=0.30)
-    parser.add_argument('--w-color', type=float, default=0.20)
-    parser.add_argument('--w-clip-visual', type=float, default=0.14)
-    parser.add_argument('--w-snapshot', type=float, default=0.10)
-    parser.add_argument('--w-label', type=float, default=0.08)
-    parser.add_argument('--w-shape', type=float, default=0.08)
-    parser.add_argument('--w-clip-text', type=float, default=0.05)
-    parser.add_argument('--w-room', type=float, default=0.05)
-    parser.add_argument('--unmatched-cost', type=float, default=0.42)
-    parser.add_argument('--scene-scale', type=float, default=5.0)
+    # Mode preset (sets default weights; individual --w-* flags override)
+    parser.add_argument('--mode', choices=['static', 'dynamic'], default='static',
+                        help='Matching mode: "static" (objects stay put) or '
+                             '"dynamic" (objects may move/be removed)')
+
+    # Weight overrides (default=None means "use preset")
+    parser.add_argument('--w-spatial', type=float, default=None)
+    parser.add_argument('--w-color', type=float, default=None)
+    parser.add_argument('--w-clip-visual', type=float, default=None)
+    parser.add_argument('--w-snapshot', type=float, default=None)
+    parser.add_argument('--w-label', type=float, default=None)
+    parser.add_argument('--w-shape', type=float, default=None)
+    parser.add_argument('--w-clip-text', type=float, default=None)
+    parser.add_argument('--w-room', type=float, default=None)
+    parser.add_argument('--unmatched-cost', type=float, default=None)
+    parser.add_argument('--scene-scale', type=float, default=-1.0,
+                        help='Scene scale in meters (-1 = auto from data)')
 
     # Change detection thresholds
     parser.add_argument('--same-clip-min', type=float, default=0.75)
@@ -774,40 +915,118 @@ def main():
 
     args = parser.parse_args()
 
-    weights = MatchWeights(
-        w_spatial=args.w_spatial,
-        w_color=args.w_color,
-        w_clip_visual=args.w_clip_visual,
-        w_snapshot=args.w_snapshot,
-        w_label=args.w_label,
-        w_shape=args.w_shape,
-        w_clip_text=args.w_clip_text,
-        w_room=args.w_room,
-        unmatched_cost=args.unmatched_cost,
-        scene_scale=args.scene_scale,
-    )
+    # Start from preset, then apply any explicit overrides
+    weights = MatchWeights.preset(args.mode)
+    for attr, flag in [('w_spatial', 'w_spatial'), ('w_color', 'w_color'),
+                       ('w_clip_visual', 'w_clip_visual'), ('w_snapshot', 'w_snapshot'),
+                       ('w_label', 'w_label'), ('w_shape', 'w_shape'),
+                       ('w_clip_text', 'w_clip_text'), ('w_room', 'w_room'),
+                       ('unmatched_cost', 'unmatched_cost')]:
+        val = getattr(args, flag)
+        if val is not None:
+            setattr(weights, attr, val)
+    weights.scene_scale = args.scene_scale
+    print(f"[{_ts()}] Mode: {args.mode} | Position-based: "
+          f"{weights.w_spatial + weights.w_room:.0%} | "
+          f"Identity-based: "
+          f"{1.0 - weights.w_spatial - weights.w_room:.0%}")
+
+    # Mode-aware threshold defaults
+    if args.mode == 'dynamic':
+        default_same_dist = 5.0     # objects expected to move
+        default_same_clip = 0.80    # rely more on identity
+        default_moved_clip = 0.65   # accept looser identity for MOVED
+    else:
+        default_same_dist = 2.0
+        default_same_clip = 0.75
+        default_moved_clip = 0.70
+
     thresholds = ChangeThresholds(
-        same_clip_min=args.same_clip_min,
-        same_dist_max=args.same_dist_max,
-        moved_clip_min=args.moved_clip_min,
-        cost_reject=args.unmatched_cost,
+        same_clip_min=args.same_clip_min if args.same_clip_min != 0.75 else default_same_clip,
+        same_dist_max=args.same_dist_max if args.same_dist_max != 2.0 else default_same_dist,
+        moved_clip_min=args.moved_clip_min if args.moved_clip_min != 0.70 else default_moved_clip,
+        cost_reject=weights.unmatched_cost,
     )
 
     report = match_scene_graphs(
         args.sg1, args.sg2, weights, thresholds, verbose=args.verbose)
 
-    # Print summary
-    print(f"\n{'='*60}")
-    print(f"  MATCHING SUMMARY")
-    print(f"{'='*60}")
-    print(f"  SG1: {report.sg1_num_nodes} nodes, {report.sg1_num_edges} edges")
-    print(f"  SG2: {report.sg2_num_nodes} nodes, {report.sg2_num_edges} edges")
-    print(f"  Edge consistency: {report.edge_consistency_global:.1%}")
-    print(f"")
-    for change_type, count in report.summary.items():
-        print(f"    {change_type:12s}: {count}")
+    # ---- Print structured summary ----
+    n1, n2 = report.sg1_num_nodes, report.sg2_num_nodes
+    n_matched = sum(1 for m in report.matches
+                    if m['change_type'] in ('SAME', 'MOVED', 'REPLACED'))
+    max_possible = min(n1, n2)
+    match_pct = 100 * n_matched / max_possible if max_possible else 0
 
-    # Per-category breakdown for SAME matches
+    # Unmatched breakdowns by source
+    unmatched_sg1 = [u for u in report.unmatched if u['sg_source'] == 'sg1']
+    unmatched_sg2 = [u for u in report.unmatched if u['sg_source'] == 'sg2']
+    unseen_sg1 = [u for u in unmatched_sg1 if u['change_type'] == 'UNSEEN']
+    unseen_sg2 = [u for u in unmatched_sg2 if u['change_type'] == 'UNSEEN']
+    removed = [u for u in unmatched_sg1 if u['change_type'] == 'REMOVED']
+    added = [u for u in unmatched_sg2 if u['change_type'] == 'ADDED']
+
+    print(f"\n{'='*66}")
+    print(f"  MATCHING SUMMARY  (mode={args.mode})")
+    print(f"{'='*66}")
+    print(f"  SG1: {n1} nodes, {report.sg1_num_edges} edges")
+    print(f"  SG2: {n2} nodes, {report.sg2_num_edges} edges")
+    print(f"  Weights: spatial={weights.w_spatial}, color={weights.w_color}, "
+          f"clip_v={weights.w_clip_visual}, snap={weights.w_snapshot}")
+    print(f"  Thresholds: same_dist={thresholds.same_dist_max}m, "
+          f"same_clip={thresholds.same_clip_min}, "
+          f"moved_clip={thresholds.moved_clip_min}")
+    print(f"  Edge consistency: {report.edge_consistency_global:.1%}")
+
+    # ---- Match coverage ----
+    print(f"\n  Match coverage:")
+    print(f"    Max possible matches : {max_possible} (limited by {'SG2' if n2 <= n1 else 'SG1'})")
+    print(f"    Actual matched       : {n_matched} / {max_possible} ({match_pct:.1f}%)")
+    print(f"    SG1 matched          : {n_matched} / {n1} ({100*n_matched/n1:.1f}%)")
+    print(f"    SG2 matched          : {n_matched} / {n2} ({100*n_matched/n2:.1f}%)")
+
+    # ---- Matched pairs ----
+    print(f"\n  Matched pairs ({n_matched}):")
+    for ct in ('SAME', 'MOVED', 'REPLACED', 'UNCERTAIN'):
+        c = report.summary.get(ct, 0)
+        if c > 0:
+            print(f"    {ct:12s}: {c}")
+
+    # ---- Unmatched SG1 ----
+    print(f"\n  Unmatched SG1 nodes ({len(unmatched_sg1)}):")
+    if n1 > n2:
+        overflow = max(0, len(unmatched_sg1) - len(unseen_sg1) - len(removed))
+        # Nodes that couldn't match because SG2 is smaller
+        n_capacity = n1 - n2
+        n_rejected = len(unmatched_sg1) - len(unseen_sg1) - n_capacity
+        n_rejected = max(0, n_rejected)
+        if n_capacity > 0:
+            print(f"    No SG2 counterpart (size asymmetry: SG1 has {n1-n2} more nodes): ~{n_capacity}")
+        if n_rejected > 0:
+            print(f"    No match found (explored area, rejected by cost/label): {n_rejected}")
+    else:
+        if removed:
+            print(f"    REMOVED (area explored by SG2, object not found): {len(removed)}")
+    if unseen_sg1:
+        print(f"    UNSEEN (area not explored by SG2)              : {len(unseen_sg1)}")
+
+    # ---- Unmatched SG2 ----
+    print(f"\n  Unmatched SG2 nodes ({len(unmatched_sg2)}):")
+    if n2 > n1:
+        n_capacity = n2 - n1
+        n_rejected = len(unmatched_sg2) - len(unseen_sg2) - n_capacity
+        n_rejected = max(0, n_rejected)
+        if n_capacity > 0:
+            print(f"    No SG1 counterpart (size asymmetry: SG2 has {n2-n1} more nodes): ~{n_capacity}")
+        if n_rejected > 0:
+            print(f"    ADDED (area explored by SG1, new objects)      : {n_rejected}")
+    else:
+        if added:
+            print(f"    ADDED (area explored by SG1, new objects)      : {len(added)}")
+    if unseen_sg2:
+        print(f"    UNSEEN (area not explored by SG1)              : {len(unseen_sg2)}")
+
+    # ---- SAME quality ----
     same_matches = [m for m in report.matches if m['change_type'] == 'SAME']
     if same_matches:
         from collections import Counter
@@ -823,7 +1042,7 @@ def main():
         print(f"    Avg confidence: {sum(same_confs)/len(same_confs):.3f}")
         print(f"    Top categories: {cat_counts.most_common(8)}")
 
-    # MOVED breakdown
+    # ---- MOVED details ----
     moved_matches = [m for m in report.matches if m['change_type'] == 'MOVED']
     if moved_matches:
         moved_dists = [m['spatial_dist_3d'] for m in moved_matches]
@@ -831,7 +1050,7 @@ def main():
         print(f"    Avg distance: {sum(moved_dists)/len(moved_dists):.2f}m")
         print(f"    Range: {min(moved_dists):.2f}m - {max(moved_dists):.2f}m")
 
-    print(f"{'='*60}")
+    print(f"{'='*66}")
 
     if args.output:
         result = asdict(report)
