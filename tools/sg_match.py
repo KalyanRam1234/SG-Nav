@@ -61,6 +61,8 @@ class NodeFeatures:
     bbox_volume: float               # oriented bounding box volume
     color_hist: Optional[np.ndarray] = None   # (48,) HSV histogram
     shape_desc: Optional[np.ndarray] = None   # (4,) PCA eigenratios + log-volume
+    neighbor_cat_hist: Optional[np.ndarray] = None  # (C,) neighbor category histogram
+    neighbor_clip_agg: Optional[np.ndarray] = None  # (512,) mean neighbor CLIP
 
 
 @dataclass
@@ -333,6 +335,67 @@ def build_node_edge_snapshots(sg_data: dict, label: str = "SG") -> Dict[int, np.
     return result
 
 
+def build_adjacency(sg_data: dict) -> Dict[int, List[int]]:
+    """Build adjacency lists: node_idx -> sorted list of neighbor node_idx."""
+    adj: Dict[int, set] = defaultdict(set)
+    for e in sg_data.get('edges', []):
+        n1, n2 = e['node1_idx'], e['node2_idx']
+        adj[n1].add(n2)
+        adj[n2].add(n1)
+    return {k: sorted(v) for k, v in adj.items()}
+
+
+def compute_neighborhood_features(feats: List[NodeFeatures],
+                                  adj: Dict[int, List[int]],
+                                  cat_to_bin: Dict[str, int],
+                                  label: str = "SG") -> None:
+    """Fill in neighbor_cat_hist and neighbor_clip_agg for each node in-place.
+
+    neighbor_cat_hist: normalized histogram over neighbor categories
+    neighbor_clip_agg: mean L2-normalized CLIP embedding of neighbors
+
+    cat_to_bin must be a shared vocabulary across both graphs so that
+    histograms are directly comparable.
+    """
+    print(f"[{_ts()}] Computing neighborhood features for {label} ...")
+    idx_to_feat: Dict[int, NodeFeatures] = {f.idx: f for f in feats}
+    n_cats = len(cat_to_bin)
+
+    n_with_neighbors = 0
+    for f in feats:
+        neighbors = adj.get(f.idx, [])
+        neighbor_feats = [idx_to_feat[n] for n in neighbors if n in idx_to_feat]
+
+        if not neighbor_feats:
+            f.neighbor_cat_hist = np.zeros(n_cats, dtype=np.float32)
+            f.neighbor_clip_agg = np.zeros_like(f.clip_ft)
+            continue
+
+        n_with_neighbors += 1
+
+        # Category histogram (shared vocabulary)
+        hist = np.zeros(n_cats, dtype=np.float32)
+        for nf in neighbor_feats:
+            cat = nf.caption.lower().strip().replace('_', ' ')
+            if cat in cat_to_bin:
+                hist[cat_to_bin[cat]] += 1.0
+        total = hist.sum()
+        if total > 0:
+            hist /= total
+        f.neighbor_cat_hist = hist
+
+        # Mean CLIP aggregate
+        clip_stack = np.stack([nf.clip_ft for nf in neighbor_feats])
+        mean_clip = clip_stack.mean(axis=0)
+        norm = np.linalg.norm(mean_clip)
+        if norm > 1e-8:
+            mean_clip /= norm
+        f.neighbor_clip_agg = mean_clip.astype(np.float32)
+
+    print(f"[{_ts()}]   -> {n_with_neighbors}/{len(feats)} nodes with ≥1 neighbor, "
+          f"{n_cats} shared category bins")
+
+
 # ---------------------------------------------------------------------------
 # Cost functions
 # ---------------------------------------------------------------------------
@@ -433,25 +496,52 @@ def shape_cost(a: NodeFeatures, b: NodeFeatures) -> float:
     return 1.0 - _cosine_sim(a.shape_desc, b.shape_desc)
 
 
+def neighbor_category_cost(a: NodeFeatures, b: NodeFeatures) -> float:
+    """Cost from neighborhood category histogram intersection.
+
+    Compares what types of objects surround each node. Position-independent:
+    if a chair is next to [table, lamp, rug] in both graphs, cost is low
+    even if the chair has moved.  Returns 0.5 if either node has no histogram.
+    """
+    if a.neighbor_cat_hist is None or b.neighbor_cat_hist is None:
+        return 0.5
+    intersection = np.minimum(a.neighbor_cat_hist, b.neighbor_cat_hist).sum()
+    return 1.0 - float(intersection)
+
+
+def neighbor_clip_cost(a: NodeFeatures, b: NodeFeatures) -> float:
+    """Cost from mean-neighbor CLIP aggregate similarity.
+
+    Compares the mean CLIP visual embedding of 1-hop neighbors.
+    More discriminative than category histogram alone — captures visual
+    differences between neighborhoods with same category distribution.
+    """
+    if a.neighbor_clip_agg is None or b.neighbor_clip_agg is None:
+        return 0.5
+    return 1.0 - _cosine_sim(a.neighbor_clip_agg, b.neighbor_clip_agg)
+
+
 # ---------------------------------------------------------------------------
 # Cost matrix & Hungarian assignment
 # ---------------------------------------------------------------------------
 
 @dataclass
 class MatchWeights:
-    """Weights for combining cost components.
+    """Weights for combining cost components (10 components).
 
     Two presets available via `MatchWeights.preset()`:
       - "static"  — spatial position is primary signal (objects don't move)
-      - "dynamic" — identity (appearance) is primary signal (objects may move)
+      - "dynamic" — identity + neighborhood is primary signal (objects may move)
     """
-    w_spatial: float = 0.30
-    w_color: float = 0.20
-    w_clip_visual: float = 0.14
-    w_snapshot: float = 0.10
-    w_label: float = 0.08
-    w_shape: float = 0.08
-    w_clip_text: float = 0.05
+    w_spatial: float = 0.22
+    w_color: float = 0.16
+    w_nch: float = 0.12
+    w_clip_visual: float = 0.12
+    w_neighbor_clip: float = 0.08
+    w_snapshot: float = 0.08
+    w_label: float = 0.07
+    w_shape: float = 0.06
+    w_clip_text: float = 0.04
     w_room: float = 0.05
     unmatched_cost: float = 0.42
     scene_scale: float = 5.0
@@ -459,19 +549,21 @@ class MatchWeights:
     @staticmethod
     def preset(mode: str) -> 'MatchWeights':
         if mode == "static":
-            # Position-dependent: 35%, Identity-based: 65%
+            # Position-dependent: 27%, Identity+neighborhood: 73%
             return MatchWeights(
-                w_spatial=0.30, w_color=0.20, w_clip_visual=0.14,
-                w_snapshot=0.10, w_label=0.08, w_shape=0.08,
-                w_clip_text=0.05, w_room=0.05,
+                w_spatial=0.22, w_color=0.16, w_nch=0.12,
+                w_clip_visual=0.12, w_neighbor_clip=0.08,
+                w_snapshot=0.08, w_label=0.07, w_shape=0.06,
+                w_clip_text=0.04, w_room=0.05,
                 unmatched_cost=0.42)
         elif mode == "dynamic":
-            # Position-dependent: 10%, Identity-based: 90%
-            # Color histogram is the strongest instance discriminator
+            # Position-dependent: 9%, Identity+neighborhood: 91%
+            # NCH is crucial — position-independent structural context
             return MatchWeights(
-                w_spatial=0.08, w_color=0.28, w_clip_visual=0.18,
-                w_snapshot=0.14, w_label=0.10, w_shape=0.10,
-                w_clip_text=0.07, w_room=0.05,
+                w_spatial=0.05, w_color=0.20, w_nch=0.18,
+                w_clip_visual=0.14, w_neighbor_clip=0.12,
+                w_snapshot=0.10, w_label=0.08, w_shape=0.05,
+                w_clip_text=0.04, w_room=0.04,
                 unmatched_cost=0.38)
         else:
             raise ValueError(f"Unknown mode: {mode!r}. Use 'static' or 'dynamic'.")
@@ -517,6 +609,8 @@ def build_cost_matrix(feats_1: list, feats_2: list,
             c_snap = snapshot_context_cost(sa, sb)
             c_color = color_hist_cost(fa, fb)
             c_shape = shape_cost(fa, fb)
+            c_nch = neighbor_category_cost(fa, fb)
+            c_nclip = neighbor_clip_cost(fa, fb)
 
             cost[i, j] = (weights.w_clip_visual * c_vis +
                           weights.w_spatial * c_spa +
@@ -525,7 +619,9 @@ def build_cost_matrix(feats_1: list, feats_2: list,
                           weights.w_room * c_rm +
                           weights.w_snapshot * c_snap +
                           weights.w_color * c_color +
-                          weights.w_shape * c_shape)
+                          weights.w_shape * c_shape +
+                          weights.w_nch * c_nch +
+                          weights.w_neighbor_clip * c_nclip)
 
     elapsed = time.time() - t0
     print(f"[{_ts()}]   Cost matrix built in {elapsed:.1f}s")
@@ -547,6 +643,98 @@ def solve_assignment(cost_matrix: np.ndarray, n1: int, n2: int,
         if r < n1 and c < n2:
             pairs.append((r, c, cost_matrix[r, c]))
     return pairs
+
+
+def iterative_neighborhood_consensus(
+        cost_matrix: np.ndarray,
+        feats_1: List[NodeFeatures], feats_2: List[NodeFeatures],
+        adj_1: Dict[int, List[int]], adj_2: Dict[int, List[int]],
+        n_iters: int = 3,
+        bonus: float = 0.04, penalty: float = 0.03,
+        unmatched_cost: float = 0.42) -> list:
+    """Iterative refinement: adjust costs based on neighborhood match consistency.
+
+    After initial Hungarian, for each matched pair (a→b):
+      - Count what fraction of a's neighbors are matched to b's neighbors
+      - High consistency → reduce cost (bonus); low → increase cost (penalty)
+    Re-solve and repeat for n_iters rounds.
+
+    This enforces structural consistency: if chair-A matches chair-X, then
+    chair-A's neighbor table-B should ideally match chair-X's neighbor table-Y.
+    """
+    n1, n2 = len(feats_1), len(feats_2)
+    n = cost_matrix.shape[0]
+
+    # Build fast lookups: feat list index → node_idx, and reverse
+    idx1_to_pos = {f.idx: i for i, f in enumerate(feats_1)}
+    idx2_to_pos = {f.idx: j for j, f in enumerate(feats_2)}
+
+    # Adjacency in terms of feature-list positions (not node_idx)
+    adj1_pos: Dict[int, set] = {}
+    for i, f in enumerate(feats_1):
+        neighbors = adj_1.get(f.idx, [])
+        adj1_pos[i] = {idx1_to_pos[n] for n in neighbors if n in idx1_to_pos}
+
+    adj2_pos: Dict[int, set] = {}
+    for j, f in enumerate(feats_2):
+        neighbors = adj_2.get(f.idx, [])
+        adj2_pos[j] = {idx2_to_pos[n] for n in neighbors if n in idx2_to_pos}
+
+    working_cost = cost_matrix.copy()
+
+    for iteration in range(n_iters):
+        # Solve with current costs
+        pairs = solve_assignment(working_cost, n1, n2, unmatched_cost)
+
+        # Build match map: i → j (feature list positions)
+        match_fwd = {}  # SG1 pos → SG2 pos
+        match_rev = {}  # SG2 pos → SG1 pos
+        for i, j, c in pairs:
+            if c < unmatched_cost:
+                match_fwd[i] = j
+                match_rev[j] = i
+
+        # Compute neighborhood consistency for each real pair
+        adjustments = 0
+        n_rewarded = 0
+        total_consistency = 0.0
+        n_scored = 0
+        for i, j, c in pairs:
+            if c >= unmatched_cost:
+                continue
+            neigh_i = adj1_pos.get(i, set())
+            neigh_j = adj2_pos.get(j, set())
+            if not neigh_i and not neigh_j:
+                continue
+
+            # Count how many neighbors of i are matched to neighbors of j
+            consistent = 0
+            for ni in neigh_i:
+                matched_to = match_fwd.get(ni)
+                if matched_to is not None and matched_to in neigh_j:
+                    consistent += 1
+
+            max_possible = max(len(neigh_i), len(neigh_j), 1)
+            consistency_score = consistent / max_possible
+            total_consistency += consistency_score
+            n_scored += 1
+
+            # Reward-only: only reduce cost for high-consistency pairs
+            # Don't penalize low consistency (avoids error propagation)
+            if consistency_score >= 0.2:
+                delta = -bonus * consistency_score
+                working_cost[i, j] = max(0.0, working_cost[i, j] + delta)
+                n_rewarded += 1
+            adjustments += 1
+
+        avg_cons = total_consistency / max(n_scored, 1)
+        print(f"[{_ts()}]   Refinement round {iteration+1}/{n_iters}: "
+              f"{len(match_fwd)} matches, {n_rewarded} rewarded, "
+              f"avg neighborhood consistency: {avg_cons:.3f}")
+
+    # Final solve
+    final_pairs = solve_assignment(working_cost, n1, n2, unmatched_cost)
+    return final_pairs
 
 
 # ---------------------------------------------------------------------------
@@ -687,7 +875,8 @@ def load_scene_graph(filepath: str) -> Tuple[dict, dict]:
 def match_scene_graphs(sg1_path: str, sg2_path: str,
                        weights: MatchWeights = None,
                        thresholds: ChangeThresholds = None,
-                       verbose: bool = False) -> MatchReport:
+                       verbose: bool = False,
+                       refine_iters: int = 0) -> MatchReport:
     """Full matching pipeline between two saved scene graphs."""
     if weights is None:
         weights = MatchWeights()
@@ -702,6 +891,16 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
 
     snaps_1 = build_node_edge_snapshots(sg1_data, label="SG1")
     snaps_2 = build_node_edge_snapshots(sg2_data, label="SG2")
+
+    # Build adjacency and compute neighborhood features (shared vocabulary)
+    adj_1 = build_adjacency(sg1_data)
+    adj_2 = build_adjacency(sg2_data)
+    all_cats = sorted(set(
+        f.caption.lower().strip().replace('_', ' ')
+        for f in feats_1 + feats_2))
+    cat_to_bin = {c: i for i, c in enumerate(all_cats)}
+    compute_neighborhood_features(feats_1, adj_1, cat_to_bin, label="SG1")
+    compute_neighborhood_features(feats_2, adj_2, cat_to_bin, label="SG2")
 
     # Auto-compute scene_scale if not overridden
     auto_scale = compute_auto_scene_scale(feats_1, feats_2)
@@ -752,7 +951,15 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
 
     # Build and solve cost matrix
     cost_matrix = build_cost_matrix(feats_1, feats_2, weights, snaps_1, snaps_2)
-    pairs = solve_assignment(cost_matrix, n1, n2, weights.unmatched_cost)
+
+    if refine_iters > 0:
+        print(f"[{_ts()}] Running iterative neighborhood consensus "
+              f"({refine_iters} rounds) ...")
+        pairs = iterative_neighborhood_consensus(
+            cost_matrix, feats_1, feats_2, adj_1, adj_2,
+            n_iters=refine_iters, unmatched_cost=weights.unmatched_cost)
+    else:
+        pairs = solve_assignment(cost_matrix, n1, n2, weights.unmatched_cost)
 
     print(f"[{_ts()}] Classifying {len(pairs)} matched pairs ...")
 
@@ -898,7 +1105,9 @@ def main():
     # Weight overrides (default=None means "use preset")
     parser.add_argument('--w-spatial', type=float, default=None)
     parser.add_argument('--w-color', type=float, default=None)
+    parser.add_argument('--w-nch', type=float, default=None)
     parser.add_argument('--w-clip-visual', type=float, default=None)
+    parser.add_argument('--w-neighbor-clip', type=float, default=None)
     parser.add_argument('--w-snapshot', type=float, default=None)
     parser.add_argument('--w-label', type=float, default=None)
     parser.add_argument('--w-shape', type=float, default=None)
@@ -907,6 +1116,10 @@ def main():
     parser.add_argument('--unmatched-cost', type=float, default=None)
     parser.add_argument('--scene-scale', type=float, default=-1.0,
                         help='Scene scale in meters (-1 = auto from data)')
+
+    # Iterative refinement
+    parser.add_argument('--refine-iters', type=int, default=0,
+                        help='Neighborhood consensus refinement iterations (0=off, 2-3 recommended)')
 
     # Change detection thresholds
     parser.add_argument('--same-clip-min', type=float, default=0.75)
@@ -918,7 +1131,9 @@ def main():
     # Start from preset, then apply any explicit overrides
     weights = MatchWeights.preset(args.mode)
     for attr, flag in [('w_spatial', 'w_spatial'), ('w_color', 'w_color'),
-                       ('w_clip_visual', 'w_clip_visual'), ('w_snapshot', 'w_snapshot'),
+                       ('w_nch', 'w_nch'), ('w_clip_visual', 'w_clip_visual'),
+                       ('w_neighbor_clip', 'w_neighbor_clip'),
+                       ('w_snapshot', 'w_snapshot'),
                        ('w_label', 'w_label'), ('w_shape', 'w_shape'),
                        ('w_clip_text', 'w_clip_text'), ('w_room', 'w_room'),
                        ('unmatched_cost', 'unmatched_cost')]:
@@ -926,10 +1141,12 @@ def main():
         if val is not None:
             setattr(weights, attr, val)
     weights.scene_scale = args.scene_scale
-    print(f"[{_ts()}] Mode: {args.mode} | Position-based: "
-          f"{weights.w_spatial + weights.w_room:.0%} | "
-          f"Identity-based: "
-          f"{1.0 - weights.w_spatial - weights.w_room:.0%}")
+    neigh_pct = weights.w_nch + weights.w_neighbor_clip
+    pos_pct = weights.w_spatial + weights.w_room
+    print(f"[{_ts()}] Mode: {args.mode} | Position: {pos_pct:.0%} | "
+          f"Neighborhood: {neigh_pct:.0%} | "
+          f"Identity: {1.0 - pos_pct - neigh_pct:.0%} | "
+          f"Refine iters: {args.refine_iters}")
 
     # Mode-aware threshold defaults
     if args.mode == 'dynamic':
@@ -949,12 +1166,15 @@ def main():
     )
 
     report = match_scene_graphs(
-        args.sg1, args.sg2, weights, thresholds, verbose=args.verbose)
+        args.sg1, args.sg2, weights, thresholds,
+        verbose=args.verbose, refine_iters=args.refine_iters)
 
     # ---- Print structured summary ----
     n1, n2 = report.sg1_num_nodes, report.sg2_num_nodes
     n_matched = sum(1 for m in report.matches
                     if m['change_type'] in ('SAME', 'MOVED', 'REPLACED'))
+    n_uncertain = sum(1 for m in report.matches
+                      if m['change_type'] == 'UNCERTAIN')
     max_possible = min(n1, n2)
     match_pct = 100 * n_matched / max_possible if max_possible else 0
 
@@ -966,91 +1186,133 @@ def main():
     removed = [u for u in unmatched_sg1 if u['change_type'] == 'REMOVED']
     added = [u for u in unmatched_sg2 if u['change_type'] == 'ADDED']
 
-    print(f"\n{'='*66}")
-    print(f"  MATCHING SUMMARY  (mode={args.mode})")
-    print(f"{'='*66}")
-    print(f"  SG1: {n1} nodes, {report.sg1_num_edges} edges")
-    print(f"  SG2: {n2} nodes, {report.sg2_num_edges} edges")
-    print(f"  Weights: spatial={weights.w_spatial}, color={weights.w_color}, "
-          f"clip_v={weights.w_clip_visual}, snap={weights.w_snapshot}")
-    print(f"  Thresholds: same_dist={thresholds.same_dist_max}m, "
-          f"same_clip={thresholds.same_clip_min}, "
-          f"moved_clip={thresholds.moved_clip_min}")
-    print(f"  Edge consistency: {report.edge_consistency_global:.1%}")
-
-    # ---- Match coverage ----
-    print(f"\n  Match coverage:")
-    print(f"    Max possible matches : {max_possible} (limited by {'SG2' if n2 <= n1 else 'SG1'})")
-    print(f"    Actual matched       : {n_matched} / {max_possible} ({match_pct:.1f}%)")
-    print(f"    SG1 matched          : {n_matched} / {n1} ({100*n_matched/n1:.1f}%)")
-    print(f"    SG2 matched          : {n_matched} / {n2} ({100*n_matched/n2:.1f}%)")
-
-    # ---- Matched pairs ----
-    print(f"\n  Matched pairs ({n_matched}):")
-    for ct in ('SAME', 'MOVED', 'REPLACED', 'UNCERTAIN'):
-        c = report.summary.get(ct, 0)
-        if c > 0:
-            print(f"    {ct:12s}: {c}")
-
-    # ---- Unmatched SG1 ----
-    print(f"\n  Unmatched SG1 nodes ({len(unmatched_sg1)}):")
-    if n1 > n2:
-        overflow = max(0, len(unmatched_sg1) - len(unseen_sg1) - len(removed))
-        # Nodes that couldn't match because SG2 is smaller
-        n_capacity = n1 - n2
-        n_rejected = len(unmatched_sg1) - len(unseen_sg1) - n_capacity
-        n_rejected = max(0, n_rejected)
-        if n_capacity > 0:
-            print(f"    No SG2 counterpart (size asymmetry: SG1 has {n1-n2} more nodes): ~{n_capacity}")
-        if n_rejected > 0:
-            print(f"    No match found (explored area, rejected by cost/label): {n_rejected}")
-    else:
-        if removed:
-            print(f"    REMOVED (area explored by SG2, object not found): {len(removed)}")
-    if unseen_sg1:
-        print(f"    UNSEEN (area not explored by SG2)              : {len(unseen_sg1)}")
-
-    # ---- Unmatched SG2 ----
-    print(f"\n  Unmatched SG2 nodes ({len(unmatched_sg2)}):")
-    if n2 > n1:
-        n_capacity = n2 - n1
-        n_rejected = len(unmatched_sg2) - len(unseen_sg2) - n_capacity
-        n_rejected = max(0, n_rejected)
-        if n_capacity > 0:
-            print(f"    No SG1 counterpart (size asymmetry: SG2 has {n2-n1} more nodes): ~{n_capacity}")
-        if n_rejected > 0:
-            print(f"    ADDED (area explored by SG1, new objects)      : {n_rejected}")
-    else:
-        if added:
-            print(f"    ADDED (area explored by SG1, new objects)      : {len(added)}")
-    if unseen_sg2:
-        print(f"    UNSEEN (area not explored by SG1)              : {len(unseen_sg2)}")
-
-    # ---- SAME quality ----
+    # Pre-compute stats for SAME and MOVED
     same_matches = [m for m in report.matches if m['change_type'] == 'SAME']
+    moved_matches = [m for m in report.matches if m['change_type'] == 'MOVED']
+
+    def _avg(lst):
+        return sum(lst) / len(lst) if lst else 0.0
+
+    same_clips = [m['clip_visual_sim'] for m in same_matches]
+    same_colors = [m['color_hist_sim'] for m in same_matches]
+    same_dists = [m['spatial_dist_3d'] for m in same_matches]
+    same_confs = [m['confidence'] for m in same_matches]
+    moved_dists = [m['spatial_dist_3d'] for m in moved_matches]
+    moved_clips = [m['clip_visual_sim'] for m in moved_matches]
+    moved_colors = [m['color_hist_sim'] for m in moved_matches]
+
+    # Size asymmetry breakdown
+    if n1 > n2:
+        n_capacity_overflow = n1 - n2
+        n_rejected = max(0, len(unmatched_sg1) - len(unseen_sg1) - n_capacity_overflow)
+    else:
+        n_capacity_overflow = 0
+        n_rejected = len(removed)
+    if n2 > n1:
+        n_capacity_overflow_sg2 = n2 - n1
+        n_rejected_sg2 = max(0, len(unmatched_sg2) - len(unseen_sg2) - n_capacity_overflow_sg2)
+    else:
+        n_capacity_overflow_sg2 = 0
+        n_rejected_sg2 = len(added)
+
+    # ================================================================
+    # RESULTS TABLE
+    # ================================================================
+    W = 66
+    sep = '=' * W
+    thin = '-' * W
+
+    print(f"\n{sep}")
+    print(f"  MATCHING RESULTS  (mode={args.mode})")
+    print(f"{sep}")
+
+    # ---- Overview table ----
+    print(f"\n  {'Metric':<36s} {'Value':>26s}")
+    print(f"  {thin}")
+    print(f"  {'SG1 nodes / edges':<36s} {n1:>12d} / {report.sg1_num_edges:<12d}")
+    print(f"  {'SG2 nodes / edges':<36s} {n2:>12d} / {report.sg2_num_edges:<12d}")
+    print(f"  {'Edge consistency':<36s} {report.edge_consistency_global:>25.1%}")
+    print(f"  {'Match rate (of smaller graph)':<36s} {n_matched:>5d} / {max_possible} ({match_pct:.1f}%)")
+
+    # ---- Match classification table ----
+    print(f"\n  {'Change Type':<16s} {'Count':>7s} {'Avg Dist':>10s} "
+          f"{'Avg CLIP':>10s} {'Avg Color':>10s}")
+    print(f"  {thin}")
     if same_matches:
+        print(f"  {'SAME':<16s} {len(same_matches):>7d} {_avg(same_dists):>9.2f}m "
+              f"{_avg(same_clips):>10.3f} {_avg(same_colors):>10.3f}")
+    if moved_matches:
+        print(f"  {'MOVED':<16s} {len(moved_matches):>7d} {_avg(moved_dists):>9.2f}m "
+              f"{_avg(moved_clips):>10.3f} {_avg(moved_colors):>10.3f}")
+    replaced = [m for m in report.matches if m['change_type'] == 'REPLACED']
+    if replaced:
+        print(f"  {'REPLACED':<16s} {len(replaced):>7d}")
+    if n_uncertain:
+        print(f"  {'UNCERTAIN':<16s} {n_uncertain:>7d}")
+    print(f"  {thin}")
+    print(f"  {'Total matched':<16s} {n_matched + n_uncertain:>7d}")
+
+    # ---- Unmatched table ----
+    print(f"\n  {'Unmatched Nodes':<36s} {'SG1':>8s} {'SG2':>8s}")
+    print(f"  {thin}")
+    if n_capacity_overflow > 0:
+        print(f"  {'Size asymmetry (no counterpart)':<36s} {n_capacity_overflow:>8d} {'—':>8s}")
+    if n_capacity_overflow_sg2 > 0:
+        print(f"  {'Size asymmetry (no counterpart)':<36s} {'—':>8s} {n_capacity_overflow_sg2:>8d}")
+    print(f"  {'Rejected (cost/label mismatch)':<36s} "
+          f"{n_rejected:>8d} {n_rejected_sg2:>8d}")
+    print(f"  {'UNSEEN (unexplored area)':<36s} "
+          f"{len(unseen_sg1):>8d} {len(unseen_sg2):>8d}")
+    print(f"  {thin}")
+    print(f"  {'Total unmatched':<36s} "
+          f"{len(unmatched_sg1):>8d} {len(unmatched_sg2):>8d}")
+
+    # ---- SAME quality details ----
+    if same_matches:
+        print(f"\n  SAME Quality (n={len(same_matches)}):")
+        print(f"  {'Metric':<28s} {'Avg':>8s} {'Min':>8s} {'Max':>8s}")
+        print(f"  {thin}")
+        print(f"  {'CLIP visual sim':<28s} {_avg(same_clips):>8.3f} "
+              f"{min(same_clips):>8.3f} {max(same_clips):>8.3f}")
+        print(f"  {'Color histogram sim':<28s} {_avg(same_colors):>8.3f} "
+              f"{min(same_colors):>8.3f} {max(same_colors):>8.3f}")
+        print(f"  {'Spatial distance (m)':<28s} {_avg(same_dists):>8.2f} "
+              f"{min(same_dists):>8.2f} {max(same_dists):>8.2f}")
+        print(f"  {'Confidence':<28s} {_avg(same_confs):>8.3f} "
+              f"{min(same_confs):>8.3f} {max(same_confs):>8.3f}")
+
         from collections import Counter
         cat_counts = Counter(m['sg1_caption'] for m in same_matches)
-        same_dists = [m['spatial_dist_3d'] for m in same_matches]
-        same_clips = [m['clip_visual_sim'] for m in same_matches]
-        same_colors = [m['color_hist_sim'] for m in same_matches]
-        same_confs = [m['confidence'] for m in same_matches]
-        print(f"\n  SAME quality (n={len(same_matches)}):")
-        print(f"    Avg CLIP sim:   {sum(same_clips)/len(same_clips):.3f}")
-        print(f"    Avg color sim:  {sum(same_colors)/len(same_colors):.3f}")
-        print(f"    Avg distance:   {sum(same_dists)/len(same_dists):.2f}m")
-        print(f"    Avg confidence: {sum(same_confs)/len(same_confs):.3f}")
-        print(f"    Top categories: {cat_counts.most_common(8)}")
+        top_cats = cat_counts.most_common(8)
+        cats_str = ', '.join(f"{cat}({n})" for cat, n in top_cats)
+        print(f"  Top categories: {cats_str}")
 
     # ---- MOVED details ----
-    moved_matches = [m for m in report.matches if m['change_type'] == 'MOVED']
     if moved_matches:
-        moved_dists = [m['spatial_dist_3d'] for m in moved_matches]
-        print(f"\n  MOVED details (n={len(moved_matches)}):")
-        print(f"    Avg distance: {sum(moved_dists)/len(moved_dists):.2f}m")
-        print(f"    Range: {min(moved_dists):.2f}m - {max(moved_dists):.2f}m")
+        print(f"\n  MOVED Details (n={len(moved_matches)}):")
+        print(f"  {'Metric':<28s} {'Avg':>8s} {'Min':>8s} {'Max':>8s}")
+        print(f"  {thin}")
+        print(f"  {'Spatial distance (m)':<28s} {_avg(moved_dists):>8.2f} "
+              f"{min(moved_dists):>8.2f} {max(moved_dists):>8.2f}")
+        print(f"  {'CLIP visual sim':<28s} {_avg(moved_clips):>8.3f} "
+              f"{min(moved_clips):>8.3f} {max(moved_clips):>8.3f}")
+        print(f"  {'Color histogram sim':<28s} {_avg(moved_colors):>8.3f} "
+              f"{min(moved_colors):>8.3f} {max(moved_colors):>8.3f}")
 
-    print(f"{'='*66}")
+    # ---- Config footer ----
+    neigh_pct = weights.w_nch + weights.w_neighbor_clip
+    pos_pct = weights.w_spatial + weights.w_room
+    id_pct = 1.0 - pos_pct - neigh_pct
+    print(f"\n  Config:")
+    print(f"  {'Weight split':<28s}  Position {pos_pct:.0%} | "
+          f"Neighborhood {neigh_pct:.0%} | Identity {id_pct:.0%}")
+    print(f"  {'Thresholds':<28s}  same_dist≤{thresholds.same_dist_max}m  "
+          f"same_clip≥{thresholds.same_clip_min}  "
+          f"moved_clip≥{thresholds.moved_clip_min}")
+    if args.refine_iters > 0:
+        print(f"  {'Refinement':<28s}  {args.refine_iters} iterations")
+
+    print(f"{sep}")
 
     if args.output:
         result = asdict(report)
