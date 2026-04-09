@@ -56,6 +56,7 @@ class NodeFeatures:
     centroid_3d: np.ndarray          # (3,) mean of point cloud
     center_2d: Optional[list]        # [x, y] map grid coords
     room_idx: Optional[int]
+    room_caption: Optional[str]      # room type name (e.g. "kitchen")
     num_detections: int
     num_points: int                  # total points in point cloud
     bbox_volume: float               # oriented bounding box volume
@@ -63,6 +64,7 @@ class NodeFeatures:
     shape_desc: Optional[np.ndarray] = None   # (4,) PCA eigenratios + log-volume
     neighbor_cat_hist: Optional[np.ndarray] = None  # (C,) neighbor category histogram
     neighbor_clip_agg: Optional[np.ndarray] = None  # (512,) mean neighbor CLIP
+    relation_hist: Optional[np.ndarray] = None       # (R,) spatial relation type histogram
 
 
 @dataclass
@@ -79,6 +81,8 @@ class MatchResult:
     clip_text_sim: float
     color_hist_sim: float
     same_room: bool
+    sg1_room: Optional[str]
+    sg2_room: Optional[str]
     edge_consistency: float
     confidence: float
 
@@ -92,6 +96,7 @@ class UnmatchedNode:
     change_type: str                 # ADDED or REMOVED
     centroid_3d: list
     room_idx: Optional[int]
+    room_caption: Optional[str]
 
 
 @dataclass
@@ -106,6 +111,8 @@ class MatchReport:
     matches: list
     unmatched: list
     edge_consistency_global: float
+    edge_consistency_soft: float
+    edge_consistency_detail: dict       # EdgeConsistencyReport as dict
     summary: dict
 
 
@@ -261,6 +268,12 @@ def extract_node_features(sg_data: dict, label: str = "SG") -> List[NodeFeatures
     features = []
     total = len(sg_data['nodes'])
     print(f"[{_ts()}] Extracting features for {label} ({total} raw nodes) ...")
+
+    # Build room_idx → caption lookup from room_nodes
+    room_captions: Dict[int, str] = {}
+    for ri, rn in enumerate(sg_data.get('room_nodes', [])):
+        room_captions[ri] = rn.get('caption', '').lower().strip()
+
     skipped = 0
     for idx, s_node in enumerate(sg_data['nodes']):
         obj = s_node.get('object')
@@ -293,6 +306,7 @@ def extract_node_features(sg_data: dict, label: str = "SG") -> List[NodeFeatures
         color_hist = _compute_color_histogram(pcd_colors)
         shape_desc = _compute_shape_descriptor(pcd_points, bbox_points)
 
+        ri = s_node.get('room_idx')
         features.append(NodeFeatures(
             idx=idx,
             caption=s_node.get('caption', ''),
@@ -300,7 +314,8 @@ def extract_node_features(sg_data: dict, label: str = "SG") -> List[NodeFeatures
             text_ft=text_ft,
             centroid_3d=centroid_3d,
             center_2d=s_node.get('center'),
-            room_idx=s_node.get('room_idx'),
+            room_idx=ri,
+            room_caption=room_captions.get(ri) if ri is not None else None,
             num_detections=num_detections,
             num_points=len(pcd_points),
             bbox_volume=bbox_volume,
@@ -313,7 +328,11 @@ def extract_node_features(sg_data: dict, label: str = "SG") -> List[NodeFeatures
 
 
 def build_node_edge_snapshots(sg_data: dict, label: str = "SG") -> Dict[int, np.ndarray]:
-    """Build a map: node_idx -> (K, 512) matrix of L2-normalized edge snapshot CLIPs."""
+    """Build a map: node_idx -> (K, 512) matrix of L2-normalized edge snapshot CLIPs.
+
+    Legacy function kept for reference; see build_rich_snapshots() for the
+    neighbor-keyed version with bbox geometry.
+    """
     print(f"[{_ts()}] Building edge snapshots for {label} ...")
     raw: Dict[int, list] = defaultdict(list)
     for e in sg_data.get('edges', []):
@@ -335,6 +354,173 @@ def build_node_edge_snapshots(sg_data: dict, label: str = "SG") -> Dict[int, np.
     return result
 
 
+@dataclass
+class RichSnapshot:
+    """Per-edge snapshot data enriched with bbox geometry."""
+    neighbor_idx: int
+    neighbor_caption: str
+    clip_feature: np.ndarray     # (512,) L2-normalized CLIP of full scene image
+    rel_offset: np.ndarray       # (2,) normalized offset (dx/diag, dy/diag) to neighbor
+    log_size_ratio: float        # log(my_area / neighbor_area)
+    my_log_aspect: float         # log(width / height) of my bbox
+
+
+def _extract_bbox_geometry(my_bbox: list, neighbor_bbox: list
+                           ) -> Tuple[np.ndarray, float, float]:
+    """Extract relative geometry from two bounding boxes.
+
+    Returns (rel_offset, log_size_ratio, my_log_aspect).
+    rel_offset is the (dx, dy) from my center to neighbor center,
+    normalized by the image diagonal so values are scale-invariant.
+    """
+    x1a, y1a, x2a, y2a = my_bbox
+    x1b, y1b, x2b, y2b = neighbor_bbox
+    my_cx, my_cy = (x1a + x2a) / 2, (y1a + y2a) / 2
+    nb_cx, nb_cy = (x1b + x2b) / 2, (y1b + y2b) / 2
+
+    diag = max(np.sqrt(640**2 + 480**2), 1.0)
+    rel_offset = np.array([(nb_cx - my_cx) / diag,
+                           (nb_cy - my_cy) / diag], dtype=np.float32)
+
+    my_w, my_h = max(x2a - x1a, 1.0), max(y2a - y1a, 1.0)
+    nb_w, nb_h = max(x2b - x1b, 1.0), max(y2b - y1b, 1.0)
+    my_area = my_w * my_h
+    nb_area = nb_w * nb_h
+    log_size_ratio = float(np.log(my_area / nb_area))
+    my_log_aspect = float(np.log(my_w / my_h))
+
+    return rel_offset, log_size_ratio, my_log_aspect
+
+
+def build_rich_snapshots(sg_data: dict, label: str = "SG"
+                         ) -> Dict[int, List[RichSnapshot]]:
+    """Build neighbor-keyed rich snapshots: node_idx -> [RichSnapshot, ...].
+
+    Each snapshot captures the CLIP feature of the scene image showing
+    this node with a specific neighbor, plus bbox geometric features
+    describing their relative layout in the image.
+    """
+    print(f"[{_ts()}] Building rich edge snapshots for {label} ...")
+    captions: Dict[int, str] = {}
+    for idx, sn in enumerate(sg_data['nodes']):
+        captions[idx] = (sn.get('caption') or '').lower().strip().replace('_', ' ')
+
+    result: Dict[int, List[RichSnapshot]] = defaultdict(list)
+    n_with_geo = 0
+    n_clip_only = 0
+
+    for e in sg_data.get('edges', []):
+        scf = e.get('snapshot_clip_features')
+        if scf is None:
+            continue
+        feat = np.asarray(scf, dtype=np.float32).flatten()
+        if feat.shape[0] != 512:
+            continue
+        norm = np.linalg.norm(feat)
+        if norm < 1e-8:
+            continue
+        feat_norm = feat / norm
+
+        n1, n2 = e['node1_idx'], e['node2_idx']
+        bboxes = e.get('snapshot_bboxes') or {}
+
+        has_geo = ('node1' in bboxes and 'node2' in bboxes and
+                   len(bboxes.get('node1', [])) == 4 and
+                   len(bboxes.get('node2', [])) == 4)
+
+        if has_geo:
+            n_with_geo += 1
+            b1, b2 = bboxes['node1'], bboxes['node2']
+            off1, lsr1, la1 = _extract_bbox_geometry(b1, b2)
+            result[n1].append(RichSnapshot(
+                neighbor_idx=n2, neighbor_caption=captions.get(n2, ''),
+                clip_feature=feat_norm,
+                rel_offset=off1, log_size_ratio=lsr1, my_log_aspect=la1))
+            off2, lsr2, la2 = _extract_bbox_geometry(b2, b1)
+            result[n2].append(RichSnapshot(
+                neighbor_idx=n1, neighbor_caption=captions.get(n1, ''),
+                clip_feature=feat_norm,
+                rel_offset=off2, log_size_ratio=lsr2, my_log_aspect=la2))
+        else:
+            n_clip_only += 1
+            zero_off = np.zeros(2, dtype=np.float32)
+            result[n1].append(RichSnapshot(
+                neighbor_idx=n2, neighbor_caption=captions.get(n2, ''),
+                clip_feature=feat_norm,
+                rel_offset=zero_off, log_size_ratio=0.0, my_log_aspect=0.0))
+            result[n2].append(RichSnapshot(
+                neighbor_idx=n1, neighbor_caption=captions.get(n1, ''),
+                clip_feature=feat_norm,
+                rel_offset=zero_off, log_size_ratio=0.0, my_log_aspect=0.0))
+
+    print(f"[{_ts()}]   -> {len(result)} nodes with snapshots "
+          f"({n_with_geo} edges with bbox geometry, {n_clip_only} CLIP-only)")
+    return dict(result)
+
+
+def _snapshot_geo_similarity(a: RichSnapshot, b: RichSnapshot) -> float:
+    """Geometric similarity between two rich snapshots.
+
+    Compares relative offset, size ratio, and aspect ratio using
+    Gaussian kernels. Returns value in [0, 1].
+    """
+    offset_diff = float(np.linalg.norm(a.rel_offset - b.rel_offset))
+    offset_sim = float(np.exp(-offset_diff**2 / (2 * 0.15**2)))
+
+    size_diff = abs(a.log_size_ratio - b.log_size_ratio)
+    size_sim = float(np.exp(-size_diff**2 / (2 * 0.8**2)))
+
+    aspect_diff = abs(a.my_log_aspect - b.my_log_aspect)
+    aspect_sim = float(np.exp(-aspect_diff**2 / (2 * 0.5**2)))
+
+    return 0.50 * offset_sim + 0.25 * size_sim + 0.25 * aspect_sim
+
+
+def rich_snapshot_cost(snaps_a: Optional[List[RichSnapshot]],
+                       snaps_b: Optional[List[RichSnapshot]]) -> float:
+    """Neighbor-keyed snapshot matching cost.
+
+    Groups snapshots by neighbor category and only compares snapshots
+    sharing the same neighbor type. Within each shared category, combines
+    CLIP similarity with bbox geometric similarity. Falls back to best
+    overall CLIP match if no neighbor categories overlap.
+    """
+    if not snaps_a or not snaps_b:
+        return 0.5
+
+    groups_a: Dict[str, List[RichSnapshot]] = defaultdict(list)
+    groups_b: Dict[str, List[RichSnapshot]] = defaultdict(list)
+    for s in snaps_a:
+        groups_a[s.neighbor_caption].append(s)
+    for s in snaps_b:
+        groups_b[s.neighbor_caption].append(s)
+
+    shared_cats = set(groups_a.keys()) & set(groups_b.keys())
+
+    if shared_cats:
+        cat_scores = []
+        for cat in shared_cats:
+            best_score = 0.0
+            for sa in groups_a[cat]:
+                for sb in groups_b[cat]:
+                    clip_sim = float(np.dot(sa.clip_feature, sb.clip_feature))
+                    geo_sim = _snapshot_geo_similarity(sa, sb)
+                    combined = 0.65 * clip_sim + 0.35 * geo_sim
+                    best_score = max(best_score, combined)
+            cat_scores.append(best_score)
+        # Use max across categories (most discriminative shared snapshot)
+        # rather than mean (which dilutes signal from many categories)
+        return 1.0 - float(max(cat_scores))
+
+    # Fallback: no shared categories → best overall CLIP match
+    best_clip = 0.0
+    for sa in snaps_a:
+        for sb in snaps_b:
+            sim = float(np.dot(sa.clip_feature, sb.clip_feature))
+            best_clip = max(best_clip, sim)
+    return 1.0 - best_clip
+
+
 def build_adjacency(sg_data: dict) -> Dict[int, List[int]]:
     """Build adjacency lists: node_idx -> sorted list of neighbor node_idx."""
     adj: Dict[int, set] = defaultdict(set)
@@ -345,14 +531,55 @@ def build_adjacency(sg_data: dict) -> Dict[int, List[int]]:
     return {k: sorted(v) for k, v in adj.items()}
 
 
+# Canonical spatial relation types extracted from edge relation text.
+# Order matters: earlier patterns take precedence for ambiguous phrases.
+RELATION_TYPES = [
+    'on top', 'inside', 'next to', 'under', 'above',
+    'below', 'left', 'right', 'front', 'behind', 'near',
+]
+N_RELATION_TYPES = len(RELATION_TYPES) + 1  # +1 for "other/unknown"
+_RELATION_KEYWORDS = [(rt, rt) for rt in RELATION_TYPES]
+
+
+def parse_spatial_relation(relation_text: str) -> int:
+    """Extract canonical spatial relation type index from LLM-generated text.
+
+    Returns index into RELATION_TYPES, or len(RELATION_TYPES) for unknown.
+    The relation text is like "the rug is located in front of the door".
+    """
+    text = (relation_text or '').lower()
+    for i, rt in enumerate(RELATION_TYPES):
+        if rt in text:
+            return i
+    return len(RELATION_TYPES)  # "other"
+
+
+def build_edge_relations(sg_data: dict) -> Dict[int, List[Tuple[int, int]]]:
+    """Build per-node edge relation data: node_idx -> [(neighbor_idx, relation_type_idx), ...].
+
+    For each edge, both endpoints get the relation. node1 gets the relation
+    as-is; node2 gets the same (relations are symmetric for our histogram).
+    """
+    rels: Dict[int, list] = defaultdict(list)
+    for e in sg_data.get('edges', []):
+        n1, n2 = e['node1_idx'], e['node2_idx']
+        rel_idx = parse_spatial_relation(e.get('relation', ''))
+        rels[n1].append((n2, rel_idx))
+        rels[n2].append((n1, rel_idx))
+    return dict(rels)
+
+
 def compute_neighborhood_features(feats: List[NodeFeatures],
                                   adj: Dict[int, List[int]],
+                                  edge_rels: Dict[int, List[Tuple[int, int]]],
                                   cat_to_bin: Dict[str, int],
                                   label: str = "SG") -> None:
-    """Fill in neighbor_cat_hist and neighbor_clip_agg for each node in-place.
+    """Fill in neighbor_cat_hist, neighbor_clip_agg, and relation_hist
+    for each node in-place.
 
     neighbor_cat_hist: normalized histogram over neighbor categories
     neighbor_clip_agg: mean L2-normalized CLIP embedding of neighbors
+    relation_hist: histogram over spatial relation types (left/right/above/...)
 
     cat_to_bin must be a shared vocabulary across both graphs so that
     histograms are directly comparable.
@@ -360,8 +587,10 @@ def compute_neighborhood_features(feats: List[NodeFeatures],
     print(f"[{_ts()}] Computing neighborhood features for {label} ...")
     idx_to_feat: Dict[int, NodeFeatures] = {f.idx: f for f in feats}
     n_cats = len(cat_to_bin)
+    n_rels = N_RELATION_TYPES
 
     n_with_neighbors = 0
+    n_with_relations = 0
     for f in feats:
         neighbors = adj.get(f.idx, [])
         neighbor_feats = [idx_to_feat[n] for n in neighbors if n in idx_to_feat]
@@ -369,6 +598,7 @@ def compute_neighborhood_features(feats: List[NodeFeatures],
         if not neighbor_feats:
             f.neighbor_cat_hist = np.zeros(n_cats, dtype=np.float32)
             f.neighbor_clip_agg = np.zeros_like(f.clip_ft)
+            f.relation_hist = np.zeros(n_rels, dtype=np.float32)
             continue
 
         n_with_neighbors += 1
@@ -392,13 +622,52 @@ def compute_neighborhood_features(feats: List[NodeFeatures],
             mean_clip /= norm
         f.neighbor_clip_agg = mean_clip.astype(np.float32)
 
+        # Relation type histogram
+        rel_hist = np.zeros(n_rels, dtype=np.float32)
+        node_rels = edge_rels.get(f.idx, [])
+        if node_rels:
+            n_with_relations += 1
+            for _, rel_type_idx in node_rels:
+                rel_hist[rel_type_idx] += 1.0
+            rel_total = rel_hist.sum()
+            if rel_total > 0:
+                rel_hist /= rel_total
+
+        f.relation_hist = rel_hist
+
     print(f"[{_ts()}]   -> {n_with_neighbors}/{len(feats)} nodes with ≥1 neighbor, "
-          f"{n_cats} shared category bins")
+          f"{n_with_relations} with relations, "
+          f"{n_cats} cat bins, {n_rels} relation types")
 
 
 # ---------------------------------------------------------------------------
 # Cost functions
 # ---------------------------------------------------------------------------
+
+# Semantic room similarity (symmetric pairs, sorted alphabetically).
+# Values are similarity in [0,1]: 1.0 = identical, 0.0 = unrelated.
+# Only non-zero off-diagonal pairs need entries; same-caption is always 1.0.
+ROOM_SEMANTIC_SIM: Dict[Tuple[str, str], float] = {
+    ('dining room', 'kitchen'):     0.65,
+    ('dining room', 'living room'): 0.45,
+    ('kitchen', 'living room'):     0.35,
+    ('kitchen', 'laundry room'):    0.35,
+    ('bedroom', 'living room'):     0.25,
+    ('bedroom', 'office room'):     0.20,
+    ('bathroom', 'laundry room'):   0.30,
+    ('bathroom', 'bedroom'):        0.15,
+    ('living room', 'lounge'):      0.60,
+    ('bedroom', 'lounge'):          0.30,
+    ('gym', 'lounge'):              0.20,
+    ('living room', 'office room'): 0.25,
+    ('dining room', 'lounge'):      0.35,
+}
+
+
+def build_room_sim_table() -> Dict[Tuple[str, str], float]:
+    """Return the room similarity lookup (keys sorted alphabetically)."""
+    return dict(ROOM_SEMANTIC_SIM)
+
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity, handling zero vectors."""
@@ -457,24 +726,25 @@ def label_cost(a: NodeFeatures, b: NodeFeatures) -> float:
     return 1.0
 
 
-def room_cost(a: NodeFeatures, b: NodeFeatures) -> float:
-    if a.room_idx is None or b.room_idx is None:
-        return 0.5
-    return 0.0 if a.room_idx == b.room_idx else 1.0
+def room_cost(a: NodeFeatures, b: NodeFeatures,
+              room_sim: Optional[Dict[Tuple[str, str], float]] = None) -> float:
+    """Room similarity cost with soft semantic matching.
 
-
-def snapshot_context_cost(snaps_a: Optional[np.ndarray],
-                          snaps_b: Optional[np.ndarray]) -> float:
-    """Cost based on best-matching edge snapshot CLIP between two nodes.
-
-    For each node we have a matrix of (K, 512) normalized snapshot features.
-    The best-match similarity is max(A @ B^T).  Returns 1 - max_sim.
-    If either node has no snapshots, returns 0.5 (no info).
+    Uses room captions (not indices) so the comparison is robust across graphs
+    with different indexing.  Semantically related rooms (kitchen/dining) get
+    partial similarity via room_sim lookup.
     """
-    if snaps_a is None or snaps_b is None:
+    rc_a, rc_b = a.room_caption, b.room_caption
+    if rc_a is None or rc_b is None:
         return 0.5
-    sim_matrix = snaps_a @ snaps_b.T       # (Ka, Kb)
-    return 1.0 - float(sim_matrix.max())
+    if rc_a == rc_b:
+        return 0.0
+    # Look up soft semantic similarity if provided
+    if room_sim is not None:
+        key = (rc_a, rc_b) if rc_a <= rc_b else (rc_b, rc_a)
+        if key in room_sim:
+            return 1.0 - room_sim[key]   # similarity → cost
+    return 1.0
 
 
 def color_hist_cost(a: NodeFeatures, b: NodeFeatures) -> float:
@@ -521,75 +791,135 @@ def neighbor_clip_cost(a: NodeFeatures, b: NodeFeatures) -> float:
     return 1.0 - _cosine_sim(a.neighbor_clip_agg, b.neighbor_clip_agg)
 
 
+def relation_hist_cost(a: NodeFeatures, b: NodeFeatures) -> float:
+    """Cost from spatial relation type histogram intersection.
+
+    Compares the distribution of edge relation types (left, above, behind, ...)
+    around each node. A node that is mostly "above" and "left of" its neighbors
+    should match another node with similar relation distribution.
+    """
+    if a.relation_hist is None or b.relation_hist is None:
+        return 0.5
+    if a.relation_hist.sum() < 1e-8 or b.relation_hist.sum() < 1e-8:
+        return 0.5
+    intersection = np.minimum(a.relation_hist, b.relation_hist).sum()
+    return 1.0 - float(intersection)
+
+
 # ---------------------------------------------------------------------------
 # Cost matrix & Hungarian assignment
 # ---------------------------------------------------------------------------
 
 @dataclass
 class MatchWeights:
-    """Weights for combining cost components (10 components).
+    """Weights for combining cost components (11 components).
 
     Two presets available via `MatchWeights.preset()`:
       - "static"  — spatial position is primary signal (objects don't move)
       - "dynamic" — identity + neighborhood is primary signal (objects may move)
     """
-    w_spatial: float = 0.22
-    w_color: float = 0.16
-    w_nch: float = 0.12
-    w_clip_visual: float = 0.12
-    w_neighbor_clip: float = 0.08
+    w_spatial: float = 0.20
+    w_color: float = 0.15
+    w_nch: float = 0.10
+    w_clip_visual: float = 0.10
+    w_neighbor_clip: float = 0.06
     w_snapshot: float = 0.08
-    w_label: float = 0.07
-    w_shape: float = 0.06
-    w_clip_text: float = 0.04
-    w_room: float = 0.05
+    w_label: float = 0.06
+    w_shape: float = 0.04
+    w_clip_text: float = 0.03
+    w_room: float = 0.10
+    w_rel_hist: float = 0.08
     unmatched_cost: float = 0.42
     scene_scale: float = 5.0
+    max_match_dist: float = -1.0   # hard spatial gate (m); <0 = auto
 
     @staticmethod
     def preset(mode: str) -> 'MatchWeights':
         if mode == "static":
-            # Position-dependent: 27%, Identity+neighborhood: 73%
+            # Position: 30%, Neighborhood+Relations: 22%, Identity: 48%
             return MatchWeights(
-                w_spatial=0.22, w_color=0.16, w_nch=0.12,
-                w_clip_visual=0.12, w_neighbor_clip=0.08,
-                w_snapshot=0.08, w_label=0.07, w_shape=0.06,
-                w_clip_text=0.04, w_room=0.05,
-                unmatched_cost=0.42)
+                w_spatial=0.18, w_color=0.14, w_nch=0.09,
+                w_clip_visual=0.10, w_neighbor_clip=0.06,
+                w_snapshot=0.11, w_label=0.06, w_shape=0.05,
+                w_clip_text=0.03, w_room=0.12,
+                w_rel_hist=0.06,
+                unmatched_cost=0.42,
+                max_match_dist=5.0)
         elif mode == "dynamic":
-            # Position-dependent: 9%, Identity+neighborhood: 91%
-            # NCH is crucial — position-independent structural context
+            # Position: 18%, Neighborhood+Relations: 28%, Identity: 54%
+            # Spatial boosted from 4%→10% to prevent wrong-instance matches
+            # among dense same-category clusters (e.g. 154 windows in bedroom)
             return MatchWeights(
-                w_spatial=0.05, w_color=0.20, w_nch=0.18,
-                w_clip_visual=0.14, w_neighbor_clip=0.12,
-                w_snapshot=0.10, w_label=0.08, w_shape=0.05,
-                w_clip_text=0.04, w_room=0.04,
-                unmatched_cost=0.38)
+                w_spatial=0.10, w_color=0.18, w_nch=0.10,
+                w_clip_visual=0.13, w_neighbor_clip=0.07,
+                w_snapshot=0.10, w_label=0.06, w_shape=0.04,
+                w_clip_text=0.04, w_room=0.08,
+                w_rel_hist=0.10,
+                unmatched_cost=0.38,
+                max_match_dist=8.0)
         else:
             raise ValueError(f"Unknown mode: {mode!r}. Use 'static' or 'dynamic'.")
 
 
+def compute_auto_max_match_dist(feats_1: list, feats_2: list,
+                                percentile: float = 90) -> float:
+    """Compute a reasonable max_match_dist from nearest-neighbor statistics.
+
+    For each SG2 node, finds the nearest same-category SG1 node.
+    Returns the given percentile of those distances (default P90).
+    Falls back to scene_scale/2 if too few same-category pairs exist.
+    """
+    nn_dists = []
+    cat_to_sg1 = defaultdict(list)
+    for f in feats_1:
+        cat_to_sg1[f.caption.lower().strip().replace('_', ' ')].append(f)
+
+    for f2 in feats_2:
+        cat = f2.caption.lower().strip().replace('_', ' ')
+        same_cat = cat_to_sg1.get(cat, [])
+        if not same_cat:
+            continue
+        min_dist = min(float(np.linalg.norm(f2.centroid_3d - f1.centroid_3d))
+                       for f1 in same_cat)
+        nn_dists.append(min_dist)
+
+    if len(nn_dists) < 10:
+        return 10.0
+
+    p_val = float(np.percentile(nn_dists, percentile))
+    # Add 50% margin for SLAM drift, clamp to [3, 15]
+    result = max(3.0, min(15.0, p_val * 1.5))
+    return result
+
+
 def build_cost_matrix(feats_1: list, feats_2: list,
                       weights: MatchWeights = None,
-                      snaps_1: Dict[int, np.ndarray] = None,
-                      snaps_2: Dict[int, np.ndarray] = None) -> np.ndarray:
+                      snaps_1: Dict[int, List[RichSnapshot]] = None,
+                      snaps_2: Dict[int, List[RichSnapshot]] = None,
+                      room_sim: Dict[Tuple[str, str], float] = None) -> np.ndarray:
     """Build the padded cost matrix for Hungarian assignment.
 
     Returns an (n1+n2) x (n1+n2) matrix where dummy entries have
-    cost = weights.unmatched_cost.
+    cost = weights.unmatched_cost.  Applies hard spatial gating:
+    pairs beyond max_match_dist are set to unmatched_cost, preventing
+    Hungarian from creating distant false matches among same-category
+    duplicates.
     """
     if weights is None:
         weights = MatchWeights()
 
     n1, n2 = len(feats_1), len(feats_2)
     n = n1 + n2
+    max_dist = weights.max_match_dist
 
     cost = np.full((n, n), weights.unmatched_cost, dtype=np.float64)
 
     total_cells = n1 * n2
     report_interval = max(1, n1 // 10)
     t0 = time.time()
-    print(f"[{_ts()}] Building cost matrix ({n1} x {n2} = {total_cells:,} cells) ...")
+    n_gated = 0
+    print(f"[{_ts()}] Building cost matrix ({n1} x {n2} = {total_cells:,} cells, "
+          f"spatial gate={max_dist:.1f}m) ...")
 
     for i, fa in enumerate(feats_1):
         if report_interval >= 5 and i % report_interval == 0 and i > 0:
@@ -600,17 +930,24 @@ def build_cost_matrix(feats_1: list, feats_2: list,
                   f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining)")
         sa = snaps_1.get(fa.idx) if snaps_1 else None
         for j, fb in enumerate(feats_2):
+            # Hard spatial gating: skip distant pairs entirely
+            raw_dist = float(np.linalg.norm(fa.centroid_3d - fb.centroid_3d))
+            if max_dist > 0 and raw_dist > max_dist:
+                n_gated += 1
+                continue  # cost stays at unmatched_cost
+
             sb = snaps_2.get(fb.idx) if snaps_2 else None
             c_vis = clip_visual_cost(fa, fb)
             c_spa = spatial_cost(fa, fb, weights.scene_scale)
             c_lbl = label_cost(fa, fb)
             c_txt = clip_text_cost(fa, fb)
-            c_rm = room_cost(fa, fb)
-            c_snap = snapshot_context_cost(sa, sb)
+            c_rm = room_cost(fa, fb, room_sim)
+            c_snap = rich_snapshot_cost(sa, sb)
             c_color = color_hist_cost(fa, fb)
             c_shape = shape_cost(fa, fb)
             c_nch = neighbor_category_cost(fa, fb)
             c_nclip = neighbor_clip_cost(fa, fb)
+            c_rh = relation_hist_cost(fa, fb)
 
             cost[i, j] = (weights.w_clip_visual * c_vis +
                           weights.w_spatial * c_spa +
@@ -621,10 +958,13 @@ def build_cost_matrix(feats_1: list, feats_2: list,
                           weights.w_color * c_color +
                           weights.w_shape * c_shape +
                           weights.w_nch * c_nch +
-                          weights.w_neighbor_clip * c_nclip)
+                          weights.w_neighbor_clip * c_nclip +
+                          weights.w_rel_hist * c_rh)
 
     elapsed = time.time() - t0
-    print(f"[{_ts()}]   Cost matrix built in {elapsed:.1f}s")
+    gated_pct = 100 * n_gated / total_cells if total_cells else 0
+    print(f"[{_ts()}]   Cost matrix built in {elapsed:.1f}s "
+          f"({n_gated:,} cells gated = {gated_pct:.1f}%)")
     return cost
 
 
@@ -651,25 +991,25 @@ def iterative_neighborhood_consensus(
         adj_1: Dict[int, List[int]], adj_2: Dict[int, List[int]],
         n_iters: int = 3,
         bonus: float = 0.04, penalty: float = 0.03,
+        proximity_m: float = 3.0,
         unmatched_cost: float = 0.42) -> list:
-    """Iterative refinement: adjust costs based on neighborhood match consistency.
+    """Iterative refinement: adjust costs based on soft neighborhood consistency.
 
-    After initial Hungarian, for each matched pair (a→b):
-      - Count what fraction of a's neighbors are matched to b's neighbors
-      - High consistency → reduce cost (bonus); low → increase cost (penalty)
-    Re-solve and repeat for n_iters rounds.
+    Uses proximity-based consistency to handle co-visibility differences:
+    instead of requiring an exact edge in the target graph, checks whether
+    matched neighbors are spatially close (within proximity_m).
 
-    This enforces structural consistency: if chair-A matches chair-X, then
-    chair-A's neighbor table-B should ideally match chair-X's neighbor table-Y.
+    For each matched pair (a→b), computes what fraction of a's matched
+    neighbors land close to b in 3D space. High consistency → reduce cost;
+    low → increase cost. Re-solve and repeat.
     """
     n1, n2 = len(feats_1), len(feats_2)
-    n = cost_matrix.shape[0]
 
-    # Build fast lookups: feat list index → node_idx, and reverse
+    # Build fast lookups
     idx1_to_pos = {f.idx: i for i, f in enumerate(feats_1)}
     idx2_to_pos = {f.idx: j for j, f in enumerate(feats_2)}
 
-    # Adjacency in terms of feature-list positions (not node_idx)
+    # Adjacency in terms of feature-list positions
     adj1_pos: Dict[int, set] = {}
     for i, f in enumerate(feats_1):
         neighbors = adj_1.get(f.idx, [])
@@ -680,91 +1020,304 @@ def iterative_neighborhood_consensus(
         neighbors = adj_2.get(f.idx, [])
         adj2_pos[j] = {idx2_to_pos[n] for n in neighbors if n in idx2_to_pos}
 
+    # SG2 edge set for hard consistency check
+    # (not used for score calculation, but tracked for logging)
+    edge_set_2_pos = set()
+    for j_src, neigh_set in adj2_pos.items():
+        for j_dst in neigh_set:
+            edge_set_2_pos.add(frozenset([j_src, j_dst]))
+
+    # 3D positions for proximity check
+    pos2 = {j: feats_2[j].centroid_3d for j in range(n2)}
+
     working_cost = cost_matrix.copy()
 
     for iteration in range(n_iters):
-        # Solve with current costs
         pairs = solve_assignment(working_cost, n1, n2, unmatched_cost)
 
-        # Build match map: i → j (feature list positions)
         match_fwd = {}  # SG1 pos → SG2 pos
-        match_rev = {}  # SG2 pos → SG1 pos
         for i, j, c in pairs:
             if c < unmatched_cost:
                 match_fwd[i] = j
-                match_rev[j] = i
 
-        # Compute neighborhood consistency for each real pair
-        adjustments = 0
         n_rewarded = 0
-        total_consistency = 0.0
+        n_penalized = 0
+        total_soft_cons = 0.0
+        total_hard_cons = 0.0
         n_scored = 0
         for i, j, c in pairs:
             if c >= unmatched_cost:
                 continue
             neigh_i = adj1_pos.get(i, set())
-            neigh_j = adj2_pos.get(j, set())
-            if not neigh_i and not neigh_j:
+            if not neigh_i:
                 continue
 
-            # Count how many neighbors of i are matched to neighbors of j
-            consistent = 0
+            # For each neighbor of i that is matched, check proximity to j
+            n_matched_neighbors = 0
+            n_close = 0
+            n_exact = 0
             for ni in neigh_i:
-                matched_to = match_fwd.get(ni)
-                if matched_to is not None and matched_to in neigh_j:
-                    consistent += 1
+                mj = match_fwd.get(ni)
+                if mj is None:
+                    continue
+                n_matched_neighbors += 1
+                # Hard: exact edge in SG2
+                if frozenset([j, mj]) in edge_set_2_pos:
+                    n_exact += 1
+                    n_close += 1
+                # Soft: proximity-based
+                elif mj in pos2 and j in pos2:
+                    d = float(np.linalg.norm(pos2[mj] - pos2[j]))
+                    if d < proximity_m:
+                        n_close += 1
 
-            max_possible = max(len(neigh_i), len(neigh_j), 1)
-            consistency_score = consistent / max_possible
-            total_consistency += consistency_score
+            if n_matched_neighbors == 0:
+                continue
+
+            soft_score = n_close / n_matched_neighbors
+            hard_score = n_exact / n_matched_neighbors
+            total_soft_cons += soft_score
+            total_hard_cons += hard_score
             n_scored += 1
 
-            # Reward-only: only reduce cost for high-consistency pairs
-            # Don't penalize low consistency (avoids error propagation)
-            if consistency_score >= 0.2:
-                delta = -bonus * consistency_score
+            # Reward high soft consistency
+            if soft_score >= 0.3:
+                delta = -bonus * soft_score
                 working_cost[i, j] = max(0.0, working_cost[i, j] + delta)
                 n_rewarded += 1
-            adjustments += 1
+            # Penalize very low consistency (no close neighbors at all)
+            elif soft_score < 0.1 and n_matched_neighbors >= 2:
+                delta = penalty * (1.0 - soft_score)
+                working_cost[i, j] = min(unmatched_cost, working_cost[i, j] + delta)
+                n_penalized += 1
 
-        avg_cons = total_consistency / max(n_scored, 1)
+        avg_soft = total_soft_cons / max(n_scored, 1)
+        avg_hard = total_hard_cons / max(n_scored, 1)
         print(f"[{_ts()}]   Refinement round {iteration+1}/{n_iters}: "
               f"{len(match_fwd)} matches, {n_rewarded} rewarded, "
-              f"avg neighborhood consistency: {avg_cons:.3f}")
+              f"{n_penalized} penalized, "
+              f"avg consistency: hard={avg_hard:.3f} soft={avg_soft:.3f}")
 
-    # Final solve
     final_pairs = solve_assignment(working_cost, n1, n2, unmatched_cost)
     return final_pairs
 
 
-# ---------------------------------------------------------------------------
-# Edge consistency
-# ---------------------------------------------------------------------------
+def spatial_reassignment(pairs: list,
+                         feats_1: List[NodeFeatures],
+                         feats_2: List[NodeFeatures],
+                         cost_matrix: np.ndarray,
+                         same_dist_max: float = 5.0,
+                         unmatched_cost: float = 0.38,
+                         max_rounds: int = 5) -> list:
+    """Post-Hungarian spatial reassignment to fix wrong-instance matches.
+
+    Iteratively, for each matched pair where spatial distance > same_dist_max:
+      1. Find all SG1 nodes of the same category that are closer to the SG2 node
+      2. If a closer SG1 node is unmatched, steal it
+      3. If a closer SG1 node is matched to a distant SG2 node, try pairwise swap
+
+    Repeats for max_rounds or until no more improvements.
+    """
+    n1, n2 = len(feats_1), len(feats_2)
+
+    # Build current assignment maps (feature-list position based)
+    match_fwd = {}  # i → j
+    match_rev = {}  # j → i
+    pair_costs = {}
+    for i, j, c in pairs:
+        if c < unmatched_cost:
+            match_fwd[i] = j
+            match_rev[j] = i
+            pair_costs[(i, j)] = c
+
+    # Build category → feature-list-position index
+    cat_to_sg1 = defaultdict(list)
+    for i, f in enumerate(feats_1):
+        cat_to_sg1[f.caption.lower().strip().replace('_', ' ')].append(i)
+
+    total_steals = 0
+    total_swaps = 0
+
+    for round_num in range(max_rounds):
+        n_steals = 0
+        n_swaps = 0
+
+        # Process each matched SG2 node
+        for j in list(range(n2)):
+            if j not in match_rev:
+                continue
+            i = match_rev[j]
+            dist_ij = float(np.linalg.norm(feats_1[i].centroid_3d - feats_2[j].centroid_3d))
+            if dist_ij <= same_dist_max:
+                continue  # already close enough
+
+            cat_j = feats_2[j].caption.lower().strip().replace('_', ' ')
+            candidates = cat_to_sg1.get(cat_j, [])
+
+            best_i2 = None
+            best_dist = dist_ij
+            for i2 in candidates:
+                if i2 == i:
+                    continue
+                d = float(np.linalg.norm(feats_1[i2].centroid_3d - feats_2[j].centroid_3d))
+                if d < best_dist:
+                    best_dist = d
+                    best_i2 = i2
+
+            if best_i2 is None:
+                continue
+
+            if best_i2 not in match_fwd:
+                # Steal: best_i2 is unmatched
+                del match_fwd[i]
+                match_fwd[best_i2] = j
+                match_rev[j] = best_i2
+                pair_costs[(best_i2, j)] = cost_matrix[best_i2, j]
+                if (i, j) in pair_costs:
+                    del pair_costs[(i, j)]
+                n_steals += 1
+            else:
+                # Swap: best_i2 is matched to j2
+                j2 = match_fwd[best_i2]
+                old_dist = (dist_ij +
+                            float(np.linalg.norm(feats_1[best_i2].centroid_3d - feats_2[j2].centroid_3d)))
+                new_dist = (best_dist +
+                            float(np.linalg.norm(feats_1[i].centroid_3d - feats_2[j2].centroid_3d)))
+                old_cost = cost_matrix[i, j] + cost_matrix[best_i2, j2]
+                new_cost = cost_matrix[best_i2, j] + cost_matrix[i, j2]
+
+                if new_dist < old_dist * 0.85 and new_cost < old_cost * 1.2:
+                    del match_fwd[i]
+                    del match_fwd[best_i2]
+                    match_fwd[best_i2] = j
+                    match_fwd[i] = j2
+                    match_rev[j] = best_i2
+                    match_rev[j2] = i
+                    pair_costs[(best_i2, j)] = cost_matrix[best_i2, j]
+                    pair_costs[(i, j2)] = cost_matrix[i, j2]
+                    if (i, j) in pair_costs:
+                        del pair_costs[(i, j)]
+                    if (best_i2, j2) in pair_costs:
+                        del pair_costs[(best_i2, j2)]
+                    n_swaps += 1
+
+        total_steals += n_steals
+        total_swaps += n_swaps
+        if n_steals == 0 and n_swaps == 0:
+            break
+
+    print(f"[{_ts()}]   Spatial reassignment ({round_num+1} rounds): "
+          f"{total_steals} steals, {total_swaps} swaps")
+
+    # Rebuild pairs list
+    new_pairs = []
+    for (i, j), c in pair_costs.items():
+        new_pairs.append((i, j, c))
+    return new_pairs
+
+@dataclass
+class EdgeConsistencyReport:
+    """Detailed edge consistency metrics."""
+    hard: float              # strict: edge must exist in target graph
+    soft: float              # proximity-based: endpoint distance < threshold
+    total_checked: int       # SG1 edges with both endpoints matched
+    exact_match: int         # edges found in SG2
+    close_no_edge: int       # endpoints <proximity_m apart but no SG2 edge
+    far_no_edge: int         # endpoints ≥proximity_m apart and no SG2 edge
+    far_due_to_long_edge: int  # far-no-edge where SG1 edge itself spans ≥proximity_m
+    dist_preserved: float    # fraction with |d_sg1 - d_sg2| < 1.5m
+    proximity_m: float       # threshold used for soft matching
+    theoretical_ceiling: float  # max soft achievable (fraction of checked edges with SG1 dist < proximity_m)
+
 
 def compute_edge_consistency(match_map: dict, edges_1: list,
-                             edges_2: list) -> float:
-    """Fraction of SG1 edges whose endpoints both map to SG2 and have a
-    corresponding edge there."""
+                             edges_2: list,
+                             feats_1: List[NodeFeatures] = None,
+                             feats_2: List[NodeFeatures] = None,
+                             proximity_m: float = 3.0) -> EdgeConsistencyReport:
+    """Compute hard and soft edge consistency with distance preservation.
+
+    Hard: fraction of SG1 edges whose mapped endpoints have an edge in SG2.
+    Soft: fraction where endpoints either have an edge OR are within proximity_m.
+    Distance preservation: fraction where |d_sg1 - d_sg2| < 1.5m.
+    Theoretical ceiling: fraction of checked SG1 edges spanning < proximity_m.
+    """
     if not edges_1:
-        return 1.0
+        return EdgeConsistencyReport(
+            hard=1.0, soft=1.0, total_checked=0, exact_match=0,
+            close_no_edge=0, far_no_edge=0, far_due_to_long_edge=0,
+            dist_preserved=1.0, proximity_m=proximity_m,
+            theoretical_ceiling=1.0)
 
     edge_set_2 = set()
     for e in edges_2:
-        pair = frozenset([e['node1_idx'], e['node2_idx']])
-        edge_set_2.add(pair)
+        edge_set_2.add(frozenset([e['node1_idx'], e['node2_idx']]))
 
-    consistent = 0
+    # Build position lookups
+    pos_1 = {}
+    if feats_1:
+        for f in feats_1:
+            pos_1[f.idx] = f.centroid_3d
+    pos_2 = {}
+    if feats_2:
+        for f in feats_2:
+            pos_2[f.idx] = f.centroid_3d
+
+    exact = 0
+    close = 0
+    far = 0
+    far_long = 0        # far-no-edge where SG1 edge ≥ proximity_m
+    n_preserved = 0      # distance well-preserved
+    n_with_dist = 0      # edges where we could compute both distances
+    n_short_sg1 = 0      # SG1 edges < proximity_m (for theoretical ceiling)
     total = 0
+
     for e in edges_1:
-        mapped_n1 = match_map.get(e['node1_idx'])
-        mapped_n2 = match_map.get(e['node2_idx'])
+        n1, n2 = e['node1_idx'], e['node2_idx']
+        mapped_n1 = match_map.get(n1)
+        mapped_n2 = match_map.get(n2)
         if mapped_n1 is None or mapped_n2 is None:
             continue
         total += 1
-        if frozenset([mapped_n1, mapped_n2]) in edge_set_2:
-            consistent += 1
 
-    return consistent / max(total, 1)
+        # SG1 edge distance
+        d_sg1 = None
+        if n1 in pos_1 and n2 in pos_1:
+            d_sg1 = float(np.linalg.norm(pos_1[n1] - pos_1[n2]))
+            if d_sg1 < proximity_m:
+                n_short_sg1 += 1
+
+        # SG2 mapped endpoint distance
+        d_sg2 = None
+        if mapped_n1 in pos_2 and mapped_n2 in pos_2:
+            d_sg2 = float(np.linalg.norm(pos_2[mapped_n1] - pos_2[mapped_n2]))
+
+        # Distance preservation
+        if d_sg1 is not None and d_sg2 is not None:
+            n_with_dist += 1
+            if abs(d_sg1 - d_sg2) < 1.5:
+                n_preserved += 1
+
+        # Edge consistency classification
+        if frozenset([mapped_n1, mapped_n2]) in edge_set_2:
+            exact += 1
+        elif d_sg2 is not None and d_sg2 < proximity_m:
+            close += 1
+        else:
+            far += 1
+            if d_sg1 is not None and d_sg1 >= proximity_m:
+                far_long += 1
+
+    hard = exact / max(total, 1)
+    soft = (exact + close) / max(total, 1)
+    dist_pres = n_preserved / max(n_with_dist, 1)
+    ceiling = n_short_sg1 / max(total, 1)
+
+    return EdgeConsistencyReport(
+        hard=hard, soft=soft, total_checked=total, exact_match=exact,
+        close_no_edge=close, far_no_edge=far, far_due_to_long_edge=far_long,
+        dist_preserved=dist_pres, proximity_m=proximity_m,
+        theoretical_ceiling=ceiling)
 
 
 def compute_edge_relation_accuracy(match_map: dict, edges_1: list,
@@ -889,18 +1442,27 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
     feats_1 = extract_node_features(sg1_data, label="SG1")
     feats_2 = extract_node_features(sg2_data, label="SG2")
 
-    snaps_1 = build_node_edge_snapshots(sg1_data, label="SG1")
-    snaps_2 = build_node_edge_snapshots(sg2_data, label="SG2")
+    snaps_1 = build_rich_snapshots(sg1_data, label="SG1")
+    snaps_2 = build_rich_snapshots(sg2_data, label="SG2")
 
-    # Build adjacency and compute neighborhood features (shared vocabulary)
+    # Build adjacency, edge relations, and compute neighborhood features
     adj_1 = build_adjacency(sg1_data)
     adj_2 = build_adjacency(sg2_data)
+    edge_rels_1 = build_edge_relations(sg1_data)
+    edge_rels_2 = build_edge_relations(sg2_data)
     all_cats = sorted(set(
         f.caption.lower().strip().replace('_', ' ')
         for f in feats_1 + feats_2))
     cat_to_bin = {c: i for i, c in enumerate(all_cats)}
-    compute_neighborhood_features(feats_1, adj_1, cat_to_bin, label="SG1")
-    compute_neighborhood_features(feats_2, adj_2, cat_to_bin, label="SG2")
+    compute_neighborhood_features(feats_1, adj_1, edge_rels_1, cat_to_bin, label="SG1")
+    compute_neighborhood_features(feats_2, adj_2, edge_rels_2, cat_to_bin, label="SG2")
+
+    # Build soft room similarity table
+    room_sim = build_room_sim_table()
+    rooms_1 = set(f.room_caption for f in feats_1 if f.room_caption)
+    rooms_2 = set(f.room_caption for f in feats_2 if f.room_caption)
+    print(f"[{_ts()}] Room hierarchy: SG1 uses {len(rooms_1)} rooms "
+          f"{sorted(rooms_1)}, SG2 uses {len(rooms_2)} rooms {sorted(rooms_2)}")
 
     # Auto-compute scene_scale if not overridden
     auto_scale = compute_auto_scene_scale(feats_1, feats_2)
@@ -934,12 +1496,14 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
             unmatched.append(asdict(UnmatchedNode(
                 sg_source="sg1", node_idx=f.idx, caption=f.caption,
                 change_type=ChangeType.REMOVED.value,
-                centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx)))
+                centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx,
+                room_caption=f.room_caption)))
         for f in feats_2:
             unmatched.append(asdict(UnmatchedNode(
                 sg_source="sg2", node_idx=f.idx, caption=f.caption,
                 change_type=ChangeType.ADDED.value,
-                centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx)))
+                centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx,
+                room_caption=f.room_caption)))
         return MatchReport(
             sg1_path=sg1_path, sg2_path=sg2_path,
             sg1_num_nodes=n1, sg2_num_nodes=n2,
@@ -947,10 +1511,21 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
             sg2_num_edges=len(sg2_data['edges']),
             matches=[], unmatched=unmatched,
             edge_consistency_global=0.0,
+            edge_consistency_soft=0.0,
+            edge_consistency_detail={},
             summary={t.value: 0 for t in ChangeType})
 
+    # Auto-compute max_match_dist if not set
+    if weights.max_match_dist < 0:
+        auto_max_dist = compute_auto_max_match_dist(feats_1, feats_2)
+        weights.max_match_dist = auto_max_dist
+        print(f"[{_ts()}] Auto max_match_dist: {auto_max_dist:.1f}m")
+    else:
+        print(f"[{_ts()}] Max match dist: {weights.max_match_dist:.1f}m (preset)")
+
     # Build and solve cost matrix
-    cost_matrix = build_cost_matrix(feats_1, feats_2, weights, snaps_1, snaps_2)
+    cost_matrix = build_cost_matrix(feats_1, feats_2, weights, snaps_1, snaps_2,
+                                    room_sim=room_sim)
 
     if refine_iters > 0:
         print(f"[{_ts()}] Running iterative neighborhood consensus "
@@ -960,6 +1535,13 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
             n_iters=refine_iters, unmatched_cost=weights.unmatched_cost)
     else:
         pairs = solve_assignment(cost_matrix, n1, n2, weights.unmatched_cost)
+
+    # Post-match spatial reassignment: fix wrong-instance matches
+    print(f"[{_ts()}] Running spatial reassignment ...")
+    pairs = spatial_reassignment(
+        pairs, feats_1, feats_2, cost_matrix,
+        same_dist_max=thresholds.same_dist_max,
+        unmatched_cost=weights.unmatched_cost)
 
     print(f"[{_ts()}] Classifying {len(pairs)} matched pairs ...")
 
@@ -975,6 +1557,9 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
     matches = []
 
     for i, j, c in pairs:
+        # Skip dummy pairs from spatial_reassignment
+        if j >= n2 or i >= n1:
+            continue
         fa, fb = feats_1[i], feats_2[j]
         change_type, confidence = classify_match(
             fa, fb, c, 0.0, thresholds)
@@ -999,7 +1584,10 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
             spatial_dist_3d=round(dist_3d, 4),
             clip_text_sim=round(text_sim, 4),
             color_hist_sim=round(chist_sim, 4),
-            same_room=(fa.room_idx == fb.room_idx),
+            same_room=(fa.room_caption == fb.room_caption
+                       if fa.room_caption and fb.room_caption else False),
+            sg1_room=fa.room_caption,
+            sg2_room=fb.room_caption,
             edge_consistency=0.0,
             confidence=confidence,
         )))
@@ -1008,6 +1596,40 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
             print(f"  {fa.caption:23s} {fb.caption:23s} {c:6.3f} "
                   f"{clip_sim:6.3f} {chist_sim:5.3f} {dist_3d:6.2f}m "
                   f"{change_type.value:>10s} {confidence:5.3f}")
+
+    # Post-classification: downgrade ambiguous MOVED to UNCERTAIN
+    # If a "MOVED" object has many same-category alternatives closer to the
+    # SG2 node, the match is likely a wrong-instance Hungarian artifact
+    cat_to_sg1_feats = defaultdict(list)
+    for f in feats_1:
+        cat_to_sg1_feats[f.caption.lower().strip().replace('_', ' ')].append(f)
+
+    n_downgraded = 0
+    for m in matches:
+        if m['change_type'] != 'MOVED':
+            continue
+        cat = m['sg2_caption'].lower().strip().replace('_', ' ')
+        sg2_c = None
+        for f in feats_2:
+            if f.idx == m['sg2_idx']:
+                sg2_c = f.centroid_3d
+                break
+        if sg2_c is None:
+            continue
+        # Count same-category SG1 nodes closer than this match
+        same_cat_sg1 = cat_to_sg1_feats.get(cat, [])
+        n_closer = sum(1 for f1 in same_cat_sg1
+                       if float(np.linalg.norm(f1.centroid_3d - sg2_c))
+                       < m['spatial_dist_3d'])
+        # If there are ≥3 closer same-category alternatives, the match
+        # is ambiguous — the "movement" is likely a wrong-instance artifact
+        if n_closer >= 3:
+            m['change_type'] = 'UNCERTAIN'
+            m['confidence'] = round(m['confidence'] * 0.5, 3)
+            n_downgraded += 1
+
+    if n_downgraded > 0:
+        print(f"[{_ts()}]   Downgraded {n_downgraded} ambiguous MOVED → UNCERTAIN")
 
     # Unmatched nodes — distinguish UNSEEN (not explored) from REMOVED/ADDED
     print(f"[{_ts()}] Classifying unmatched nodes (REMOVED/UNSEEN/ADDED) ...")
@@ -1022,7 +1644,8 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
             unmatched.append(asdict(UnmatchedNode(
                 sg_source="sg1", node_idx=f.idx, caption=f.caption,
                 change_type=ctype.value,
-                centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx)))
+                centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx,
+                room_caption=f.room_caption)))
 
     for j, f in enumerate(feats_2):
         if j not in matched_sg2:
@@ -1034,7 +1657,8 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
             unmatched.append(asdict(UnmatchedNode(
                 sg_source="sg2", node_idx=f.idx, caption=f.caption,
                 change_type=ctype.value,
-                centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx)))
+                centroid_3d=f.centroid_3d.tolist(), room_idx=f.room_idx,
+                room_caption=f.room_caption)))
 
     # Edge consistency — computed on accepted matches only (post-classification)
     print(f"[{_ts()}] Computing edge consistency ({len(matches)} matches, "
@@ -1042,18 +1666,31 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
     match_map_node = {}
     for m in matches:
         match_map_node[m['sg1_idx']] = m['sg2_idx']
-    edge_consistency = compute_edge_consistency(
-        match_map_node, sg1_data['edges'], sg2_data['edges'])
+    ec_report = compute_edge_consistency(
+        match_map_node, sg1_data['edges'], sg2_data['edges'],
+        feats_1=feats_1, feats_2=feats_2, proximity_m=3.0)
     edge_relation_acc = compute_edge_relation_accuracy(
         match_map_node, sg1_data['edges'], sg2_data['edges'])
 
     # Backfill edge_consistency into match results
     for m in matches:
-        m['edge_consistency'] = round(edge_consistency, 4)
+        m['edge_consistency'] = round(ec_report.hard, 4)
 
     if verbose:
-        print(f"\nEdge consistency (post-classification): {edge_consistency:.2%}")
-        print(f"Edge relation accuracy: {edge_relation_acc:.2%}")
+        print(f"\nEdge consistency (hard):  {ec_report.hard:.2%} "
+              f"({ec_report.exact_match}/{ec_report.total_checked} edges)")
+        print(f"Edge consistency (soft):  {ec_report.soft:.2%} "
+              f"({ec_report.exact_match + ec_report.close_no_edge}/"
+              f"{ec_report.total_checked}, "
+              f"proximity<{ec_report.proximity_m}m)")
+        print(f"  Breakdown: {ec_report.exact_match} exact, "
+              f"{ec_report.close_no_edge} close-no-edge, "
+              f"{ec_report.far_no_edge} far-no-edge "
+              f"({ec_report.far_due_to_long_edge} due to long SG1 edges)")
+        print(f"Distance preserved:      {ec_report.dist_preserved:.2%}")
+        print(f"Theoretical ceiling:     {ec_report.theoretical_ceiling:.2%} "
+              f"(fraction of checked SG1 edges < {ec_report.proximity_m}m)")
+        print(f"Edge relation accuracy:  {edge_relation_acc:.2%}")
 
     # Summary
     summary = {t.value: 0 for t in ChangeType}
@@ -1068,7 +1705,9 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
         sg1_num_edges=len(sg1_data['edges']),
         sg2_num_edges=len(sg2_data['edges']),
         matches=matches, unmatched=unmatched,
-        edge_consistency_global=round(edge_consistency, 4),
+        edge_consistency_global=round(ec_report.hard, 4),
+        edge_consistency_soft=round(ec_report.soft, 4),
+        edge_consistency_detail=asdict(ec_report),
         summary=summary,
     )
 
@@ -1113,9 +1752,13 @@ def main():
     parser.add_argument('--w-shape', type=float, default=None)
     parser.add_argument('--w-clip-text', type=float, default=None)
     parser.add_argument('--w-room', type=float, default=None)
+    parser.add_argument('--w-rel-hist', type=float, default=None)
     parser.add_argument('--unmatched-cost', type=float, default=None)
     parser.add_argument('--scene-scale', type=float, default=-1.0,
                         help='Scene scale in meters (-1 = auto from data)')
+    parser.add_argument('--max-match-dist', type=float, default=None,
+                        help='Hard spatial gate: reject matches beyond this distance (m). '
+                             'Default: auto from data or mode preset.')
 
     # Iterative refinement
     parser.add_argument('--refine-iters', type=int, default=0,
@@ -1136,21 +1779,26 @@ def main():
                        ('w_snapshot', 'w_snapshot'),
                        ('w_label', 'w_label'), ('w_shape', 'w_shape'),
                        ('w_clip_text', 'w_clip_text'), ('w_room', 'w_room'),
+                       ('w_rel_hist', 'w_rel_hist'),
                        ('unmatched_cost', 'unmatched_cost')]:
         val = getattr(args, flag)
         if val is not None:
             setattr(weights, attr, val)
     weights.scene_scale = args.scene_scale
-    neigh_pct = weights.w_nch + weights.w_neighbor_clip
+    if args.max_match_dist is not None:
+        weights.max_match_dist = args.max_match_dist
+    rel_pct = weights.w_rel_hist
+    neigh_pct = weights.w_nch + weights.w_neighbor_clip + rel_pct
     pos_pct = weights.w_spatial + weights.w_room
+    id_pct = 1.0 - pos_pct - neigh_pct
     print(f"[{_ts()}] Mode: {args.mode} | Position: {pos_pct:.0%} | "
-          f"Neighborhood: {neigh_pct:.0%} | "
-          f"Identity: {1.0 - pos_pct - neigh_pct:.0%} | "
+          f"Neighborhood: {neigh_pct:.0%} (rel_hist: {rel_pct:.0%}) | "
+          f"Identity: {id_pct:.0%} | "
           f"Refine iters: {args.refine_iters}")
 
     # Mode-aware threshold defaults
     if args.mode == 'dynamic':
-        default_same_dist = 5.0     # objects expected to move
+        default_same_dist = 3.0     # tighter than before (spatial gating handles outliers)
         default_same_clip = 0.80    # rely more on identity
         default_moved_clip = 0.65   # accept looser identity for MOVED
     else:
@@ -1231,7 +1879,22 @@ def main():
     print(f"  {thin}")
     print(f"  {'SG1 nodes / edges':<36s} {n1:>12d} / {report.sg1_num_edges:<12d}")
     print(f"  {'SG2 nodes / edges':<36s} {n2:>12d} / {report.sg2_num_edges:<12d}")
-    print(f"  {'Edge consistency':<36s} {report.edge_consistency_global:>25.1%}")
+    ec_detail = report.edge_consistency_detail
+    print(f"  {'Edge consistency (hard)':<36s} {report.edge_consistency_global:>25.1%}")
+    print(f"  {'Edge consistency (soft <3m)':<36s} {report.edge_consistency_soft:>25.1%}")
+    if ec_detail:
+        t = ec_detail.get('total_checked', 0)
+        ex = ec_detail.get('exact_match', 0)
+        cl = ec_detail.get('close_no_edge', 0)
+        fa = ec_detail.get('far_no_edge', 0)
+        fl = ec_detail.get('far_due_to_long_edge', 0)
+        dp = ec_detail.get('dist_preserved', 0)
+        ceil = ec_detail.get('theoretical_ceiling', 0)
+        print(f"    {'└ exact / close / far':<34s} {ex:>6d} / {cl:>5d} / {fa:>5d}  (of {t})")
+        if fa > 0:
+            print(f"    {'└ far: long SG1 edges (≥3m)':<34s} {fl:>6d} / {fa}")
+        print(f"  {'Distance preservation (<1.5m)':<36s} {dp:>25.1%}")
+        print(f"  {'Theoretical soft ceiling':<36s} {ceil:>25.1%}")
     print(f"  {'Match rate (of smaller graph)':<36s} {n_matched:>5d} / {max_possible} ({match_pct:.1f}%)")
 
     # ---- Match classification table ----
@@ -1251,6 +1914,34 @@ def main():
         print(f"  {'UNCERTAIN':<16s} {n_uncertain:>7d}")
     print(f"  {thin}")
     print(f"  {'Total matched':<16s} {n_matched + n_uncertain:>7d}")
+
+    # ---- Room-level matching breakdown ----
+    from collections import Counter as _Counter
+    same_room_count = sum(1 for m in report.matches
+                         if m['change_type'] in ('SAME', 'MOVED')
+                         and m.get('same_room', False))
+    total_accepted = sum(1 for m in report.matches
+                         if m['change_type'] in ('SAME', 'MOVED'))
+    room_pct = 100 * same_room_count / total_accepted if total_accepted else 0
+    print(f"\n  Room-Level Analysis:")
+    print(f"  {thin}")
+    print(f"  {'Same-room matches':<36s} {same_room_count:>5d} / {total_accepted} ({room_pct:.1f}%)")
+    # Per-room distribution of matched nodes
+    room_same = _Counter()
+    room_moved = _Counter()
+    for m in report.matches:
+        r_label = m.get('sg1_room') or '(unknown)'
+        if m['change_type'] == 'SAME':
+            room_same[r_label] += 1
+        elif m['change_type'] == 'MOVED':
+            room_moved[r_label] += 1
+    all_room_labels = sorted(set(list(room_same.keys()) + list(room_moved.keys())))
+    if all_room_labels:
+        print(f"  {'Room':<20s} {'SAME':>8s} {'MOVED':>8s} {'Total':>8s}")
+        print(f"  {thin}")
+        for rl in all_room_labels:
+            s, mv = room_same.get(rl, 0), room_moved.get(rl, 0)
+            print(f"  {rl:<20s} {s:>8d} {mv:>8d} {s+mv:>8d}")
 
     # ---- Unmatched table ----
     print(f"\n  {'Unmatched Nodes':<36s} {'SG1':>8s} {'SG2':>8s}")
@@ -1300,15 +1991,18 @@ def main():
               f"{min(moved_colors):>8.3f} {max(moved_colors):>8.3f}")
 
     # ---- Config footer ----
-    neigh_pct = weights.w_nch + weights.w_neighbor_clip
+    rel_pct = weights.w_rel_hist
+    neigh_pct = weights.w_nch + weights.w_neighbor_clip + rel_pct
     pos_pct = weights.w_spatial + weights.w_room
     id_pct = 1.0 - pos_pct - neigh_pct
     print(f"\n  Config:")
     print(f"  {'Weight split':<28s}  Position {pos_pct:.0%} | "
-          f"Neighborhood {neigh_pct:.0%} | Identity {id_pct:.0%}")
+          f"Neighborhood {neigh_pct:.0%} (rel_hist: {rel_pct:.0%}) | "
+          f"Snapshot {weights.w_snapshot:.0%} | Identity {id_pct:.0%}")
     print(f"  {'Thresholds':<28s}  same_dist≤{thresholds.same_dist_max}m  "
           f"same_clip≥{thresholds.same_clip_min}  "
           f"moved_clip≥{thresholds.moved_clip_min}")
+    print(f"  {'Spatial gate':<28s}  max_match_dist={weights.max_match_dist:.1f}m")
     if args.refine_iters > 0:
         print(f"  {'Refinement':<28s}  {args.refine_iters} iterations")
 
