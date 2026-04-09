@@ -210,6 +210,7 @@ def gobs_to_detection_list(
     BG_CLASSES = ["wall", "floor", "ceiling"],
     color_path = None,
     is_navigation = False,
+    navigate_step = None,
 ):
     '''
     Return a DetectionList object from the gobs
@@ -266,6 +267,21 @@ def gobs_to_detection_list(
         
         # Treat the detection in the same way as a 3D object
         # Store information that is enough to recover the detection
+        
+        # --- Phase 1: observation metadata ---
+        pts_np = np.asarray(global_object_pcd.points)
+        obj_centroid_3d = pts_np.mean(axis=0)
+        height_range = (float(pts_np[:, 2].min()), float(pts_np[:, 2].max()))
+        
+        # Viewpoint direction: camera→object unit vector
+        if trans_pose is not None:
+            cam_pos = trans_pose[:3, 3]
+            view_dir = obj_centroid_3d - cam_pos
+            vd_norm = np.linalg.norm(view_dir)
+            view_dir = (view_dir / vd_norm).tolist() if vd_norm > 1e-8 else [0, 0, 0]
+        else:
+            view_dir = [0, 0, 0]
+
         detected_object = {
             'image_idx' : [idx],                             # idx of the image
             'mask_idx' : [mask_idx],                         # idx of the mask/detection
@@ -287,6 +303,21 @@ def gobs_to_detection_list(
             'bbox': pcd_bbox,
             'clip_ft': to_tensor(gobs['image_feats'][mask_idx]),
             'text_ft': to_tensor(gobs['text_feats'][mask_idx]),
+            
+            # Phase 1: observation metadata
+            'viewpoint_dirs': [view_dir],
+            'first_seen_step': navigate_step if navigate_step is not None else 0,
+            'last_seen_step': navigate_step if navigate_step is not None else 0,
+            'height_range': height_range,
+            'observation_confidence': float(gobs['confidence'][mask_idx]),
+            
+            # Phase 2: geometric fingerprints
+            'fpfh_descriptor': _compute_fpfh(global_object_pcd) if len(pts_np) >= 10 else np.zeros(33).tolist(),
+            'bbox_rotation': np.asarray(pcd_bbox.R).tolist() if hasattr(pcd_bbox, 'R') else [[1,0,0],[0,1,0],[0,0,1]],
+            'bbox_extent': np.asarray(pcd_bbox.extent).tolist() if hasattr(pcd_bbox, 'extent') else [0,0,0],
+            
+            # Phase 3: dominant colors (HSV k-means centroids)
+            'dominant_colors': _compute_dominant_colors(np.asarray(global_object_pcd.colors)) if len(global_object_pcd.colors) >= 3 else [],
         }
         
         if class_name in BG_CLASSES:
@@ -435,6 +466,76 @@ def get_bounding_box(cfg, pcd):
         return pcd.get_axis_aligned_bounding_box()
 
 
+def _compute_fpfh(pcd, radius_normal=0.05, radius_feature=0.15):
+    """Compute a global FPFH descriptor (33-D) from a point cloud.
+    
+    FPFH (Fast Point Feature Histogram) encodes local surface curvature
+    distribution. Averaging across all points gives a global shape fingerprint
+    that distinguishes objects with similar appearance but different geometry.
+    """
+    try:
+        pcd_copy = o3d.geometry.PointCloud(pcd)
+        pcd_copy.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=radius_normal, max_nn=30))
+        fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            pcd_copy,
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=radius_feature, max_nn=100))
+        desc = np.asarray(fpfh.data)  # (33, N)
+        if desc.shape[1] == 0:
+            return np.zeros(33, dtype=np.float32).tolist()
+        global_desc = desc.mean(axis=1).astype(np.float32)  # (33,)
+        # L2-normalize for cosine comparison
+        norm = np.linalg.norm(global_desc)
+        if norm > 1e-8:
+            global_desc /= norm
+        return global_desc.tolist()
+    except Exception:
+        return np.zeros(33, dtype=np.float32).tolist()
+
+
+def _compute_dominant_colors(pcd_colors, k=3):
+    """Extract k dominant colors from point cloud RGB via mini-batch k-means.
+    
+    Returns a list of k [R, G, B] centroids sorted by cluster size (largest first).
+    Colors are in [0, 1] range matching Open3D convention.
+    """
+    try:
+        colors = np.asarray(pcd_colors, dtype=np.float32)
+        if len(colors) < k:
+            return colors.tolist()
+        
+        # Convert to HSV for perceptually meaningful clustering
+        colors_uint8 = (np.clip(colors, 0, 1) * 255).astype(np.uint8)
+        colors_bgr = colors_uint8[:, ::-1].reshape(-1, 1, 3)
+        colors_hsv = cv2.cvtColor(colors_bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
+        # Normalize: H [0,180]→[0,1], S [0,255]→[0,1], V [0,255]→[0,1]
+        colors_hsv[:, 0] /= 180.0
+        colors_hsv[:, 1] /= 255.0
+        colors_hsv[:, 2] /= 255.0
+        
+        # Use OpenCV k-means (faster than sklearn for this)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+        # Subsample if too many points
+        if len(colors_hsv) > 1000:
+            indices = np.random.choice(len(colors_hsv), 1000, replace=False)
+            sample = colors_hsv[indices]
+        else:
+            sample = colors_hsv
+        
+        _, labels, centers = cv2.kmeans(
+            sample, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+        
+        # Sort by cluster size (largest first)
+        unique, counts = np.unique(labels.flatten(), return_counts=True)
+        order = np.argsort(-counts)
+        sorted_centers = centers[order]  # (k, 3) in normalized HSV
+        return sorted_centers.tolist()
+    except Exception:
+        return []
+
+
 def merge_obj2_into_obj1(cfg, obj1, obj2, run_dbscan=True):
     '''
     Merge the new object to the old object
@@ -443,21 +544,33 @@ def merge_obj2_into_obj1(cfg, obj1, obj2, run_dbscan=True):
     n_obj1_det = obj1['num_detections']
     n_obj2_det = obj2['num_detections']
     
+    # Fields with special merge logic (handled below the generic loop)
+    SPECIAL_FIELDS = {
+        'pcd', 'bbox', 'clip_ft', 'text_ft',
+        'score', 'captions', 'reason', 'id', 'node',
+        'first_seen_step', 'last_seen_step', 'height_range',
+        'fpfh_descriptor', 'dominant_colors', 'bbox_rotation', 'bbox_extent',
+        'observation_confidence', 'clip_ft_variance', 'clip_ft_mean_sq',
+    }
+    
     for k in obj1.keys():
         if k in ['caption']:
             # Here we need to merge two dictionaries and adjust the key of the second one
             for k2, v2 in obj2['caption'].items():
                 obj1['caption'][k2 + n_obj1_det] = v2
-        # elif k not in ['pcd', 'bbox', 'clip_ft', "text_ft"]:  # annotated by yinhang
-        elif k not in ['pcd', 'bbox', 'clip_ft', "text_ft", "score", "captions", "reason", "id", "node"]:  # added by someone
+        elif k not in SPECIAL_FIELDS:
             if isinstance(obj1[k], list) or isinstance(obj1[k], int):
                 obj1[k] += obj2[k]
             elif k == "inst_color":
                 obj1[k] = obj1[k] # Keep the initial instance color
+            elif isinstance(obj1[k], (bool, str)):
+                pass  # keep original value
+            elif isinstance(obj1[k], tuple):
+                pass  # handled in special fields if needed
             else:
                 # TODO: handle other types if needed in the future
-                raise NotImplementedError
-        else: # pcd, bbox, clip_ft, text_ft are handled below
+                raise NotImplementedError(f"Cannot merge field '{k}' of type {type(obj1[k])}")
+        else: # special fields handled below
             continue
 
     # merge pcd and bbox
@@ -469,10 +582,25 @@ def merge_obj2_into_obj1(cfg, obj1, obj2, run_dbscan=True):
     # Merge clip_ft via running average (DovSG-style)
     obj1['clip_ft'] = to_tensor(obj1['clip_ft'])
     obj2['clip_ft'] = to_tensor(obj2['clip_ft'])
+    
+    # Phase 3: track CLIP feature variance (Welford's online algorithm)
+    if 'clip_ft_mean_sq' not in obj1:
+        obj1['clip_ft_mean_sq'] = (obj1['clip_ft'] ** 2).clone()
+    old_mean = obj1['clip_ft'].clone()
+    
     obj1['clip_ft'] = (obj1['clip_ft'] * n_obj1_det +
                        obj2['clip_ft'] * n_obj2_det) / (
                        n_obj1_det + n_obj2_det)
     obj1['clip_ft'] = F.normalize(obj1['clip_ft'], dim=0)
+    
+    # Update running mean of squares for variance computation
+    obj2_clip = to_tensor(obj2['clip_ft'])
+    obj1['clip_ft_mean_sq'] = (obj1['clip_ft_mean_sq'] * n_obj1_det +
+                                (obj2_clip ** 2) * n_obj2_det) / (
+                                n_obj1_det + n_obj2_det)
+    # Variance = E[X^2] - E[X]^2
+    obj1['clip_ft_variance'] = torch.clamp(
+        obj1['clip_ft_mean_sq'] - obj1['clip_ft'] ** 2, min=0.0)
 
     # Merge text_ft via running average
     obj2['text_ft'] = to_tensor(obj2['text_ft'])
@@ -481,6 +609,40 @@ def merge_obj2_into_obj1(cfg, obj1, obj2, run_dbscan=True):
                        obj2['text_ft'] * n_obj2_det) / (
                        n_obj1_det + n_obj2_det)
     obj1['text_ft'] = F.normalize(obj1['text_ft'], dim=0)
+    
+    # Phase 1: merge observation metadata
+    if 'first_seen_step' in obj1 and 'first_seen_step' in obj2:
+        obj1['first_seen_step'] = min(obj1['first_seen_step'], obj2['first_seen_step'])
+        obj1['last_seen_step'] = max(obj1['last_seen_step'], obj2['last_seen_step'])
+    
+    if 'height_range' in obj1 and 'height_range' in obj2:
+        obj1['height_range'] = (
+            min(obj1['height_range'][0], obj2['height_range'][0]),
+            max(obj1['height_range'][1], obj2['height_range'][1]),
+        )
+    
+    # Phase 1: update observation confidence from accumulated conf/n_points
+    if 'conf' in obj1 and 'n_points' in obj1:
+        confs = obj1['conf']
+        pts = obj1['n_points']
+        total_pts = sum(pts)
+        if total_pts > 0:
+            obj1['observation_confidence'] = sum(
+                c * p for c, p in zip(confs, pts)) / total_pts
+    
+    # Phase 2: recompute FPFH from merged point cloud
+    merged_pts = np.asarray(obj1['pcd'].points)
+    if len(merged_pts) >= 10:
+        obj1['fpfh_descriptor'] = _compute_fpfh(obj1['pcd'])
+    
+    # Phase 2: recompute bbox geometry from merged bbox
+    obj1['bbox_rotation'] = np.asarray(obj1['bbox'].R).tolist()
+    obj1['bbox_extent'] = np.asarray(obj1['bbox'].extent).tolist()
+    
+    # Phase 3: recompute dominant colors from merged point cloud
+    merged_colors = np.asarray(obj1['pcd'].colors)
+    if len(merged_colors) >= 3:
+        obj1['dominant_colors'] = _compute_dominant_colors(merged_colors)
     
     return obj1
 

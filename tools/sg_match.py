@@ -65,6 +65,17 @@ class NodeFeatures:
     neighbor_cat_hist: Optional[np.ndarray] = None  # (C,) neighbor category histogram
     neighbor_clip_agg: Optional[np.ndarray] = None  # (512,) mean neighbor CLIP
     relation_hist: Optional[np.ndarray] = None       # (R,) spatial relation type histogram
+    # Phase 1: observation metadata
+    viewpoint_diversity: float = 0.0       # angular spread of observation directions [0, 1]
+    observation_span: int = 0              # last_seen_step - first_seen_step
+    observation_confidence: float = 0.5    # weighted detection confidence
+    height_range: Optional[Tuple[float, float]] = None  # (min_z, max_z) in world coords
+    # Phase 2: geometric fingerprints
+    fpfh_descriptor: Optional[np.ndarray] = None  # (33,) L2-normalized FPFH
+    bbox_extent: Optional[np.ndarray] = None       # (3,) sorted OBB dimensions
+    # Phase 3: enhanced visuals
+    clip_ft_stability: float = 1.0         # 1 - mean(clip_ft_variance); high = stable appearance
+    dominant_colors: Optional[np.ndarray] = None   # (k, 3) HSV cluster centroids
 
 
 @dataclass
@@ -264,6 +275,34 @@ def _compute_shape_descriptor(pcd_points: np.ndarray,
     return np.concatenate([ratios, [log_vol]])
 
 
+def _compute_viewpoint_diversity(viewpoint_dirs: list) -> float:
+    """Compute angular diversity of observation directions.
+
+    Returns a value in [0, 1] where 0 means single viewpoint and 1 means
+    maximally spread observations.  Uses mean pairwise angular distance.
+    """
+    if not viewpoint_dirs or len(viewpoint_dirs) < 2:
+        return 0.0
+    dirs = np.array(viewpoint_dirs, dtype=np.float32)
+    norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    dirs = dirs / norms
+    # Pairwise cosine similarities → angular distances
+    cos_sim = np.clip(dirs @ dirs.T, -1.0, 1.0)
+    n = len(dirs)
+    total_angle = 0.0
+    count = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            total_angle += np.arccos(cos_sim[i, j])
+            count += 1
+    if count == 0:
+        return 0.0
+    mean_angle = total_angle / count
+    # Normalize: max possible mean pairwise angle is π (opposite directions)
+    return float(min(mean_angle / np.pi, 1.0))
+
+
 def extract_node_features(sg_data: dict, label: str = "SG") -> List[NodeFeatures]:
     """Extract matching features from a serialized scene graph dict."""
     features = []
@@ -307,6 +346,38 @@ def extract_node_features(sg_data: dict, label: str = "SG") -> List[NodeFeatures
         color_hist = _compute_color_histogram(pcd_colors)
         shape_desc = _compute_shape_descriptor(pcd_points, bbox_points)
 
+        # Phase 1: observation metadata
+        vp_dirs = obj.get('viewpoint_dirs', [])
+        viewpoint_diversity = _compute_viewpoint_diversity(vp_dirs)
+        first_step = obj.get('first_seen_step', 0)
+        last_step = obj.get('last_seen_step', 0)
+        observation_span = max(0, last_step - first_step)
+        obs_conf = obj.get('observation_confidence', 0.5)
+        if isinstance(obs_conf, list):
+            obs_conf = float(np.mean(obs_conf)) if obs_conf else 0.5
+        hr = obj.get('height_range')
+        if isinstance(hr, (list, tuple)) and len(hr) == 2:
+            height_range = (float(hr[0]), float(hr[1]))
+        else:
+            # Fallback: compute from point cloud
+            height_range = (float(pcd_points[:, 2].min()), float(pcd_points[:, 2].max()))
+
+        # Phase 2: geometric fingerprints
+        fpfh_raw = obj.get('fpfh_descriptor')
+        fpfh_desc = np.array(fpfh_raw, dtype=np.float32) if fpfh_raw else None
+        bbox_ext_raw = obj.get('bbox_extent')
+        bbox_ext = np.sort(np.array(bbox_ext_raw, dtype=np.float32))[::-1] if bbox_ext_raw else None
+
+        # Phase 3: enhanced visuals
+        clip_var = obj.get('clip_ft_variance')
+        if clip_var is not None:
+            var_arr = np.array(clip_var, dtype=np.float32)
+            clip_ft_stability = float(1.0 - np.mean(var_arr))
+        else:
+            clip_ft_stability = 1.0  # single detection → perfectly stable
+        dom_colors = obj.get('dominant_colors')
+        dom_colors_arr = np.array(dom_colors, dtype=np.float32) if dom_colors else None
+
         ri = s_node.get('room_idx')
         features.append(NodeFeatures(
             idx=idx,
@@ -322,6 +393,14 @@ def extract_node_features(sg_data: dict, label: str = "SG") -> List[NodeFeatures
             bbox_volume=bbox_volume,
             color_hist=color_hist,
             shape_desc=shape_desc,
+            viewpoint_diversity=viewpoint_diversity,
+            observation_span=observation_span,
+            observation_confidence=float(obs_conf),
+            height_range=height_range,
+            fpfh_descriptor=fpfh_desc,
+            bbox_extent=bbox_ext,
+            clip_ft_stability=clip_ft_stability,
+            dominant_colors=dom_colors_arr,
         ))
     print(f"[{_ts()}]   -> {len(features)} valid nodes extracted "
           f"({total - len(features)} skipped)")
@@ -807,29 +886,116 @@ def relation_hist_cost(a: NodeFeatures, b: NodeFeatures) -> float:
     return 1.0 - float(intersection)
 
 
+def fpfh_cost(a: NodeFeatures, b: NodeFeatures) -> float:
+    """Cost from FPFH geometric descriptor similarity.
+
+    FPFH captures local surface curvature distribution.
+    Two objects with similar 3D shape have similar FPFH descriptors.
+    """
+    if a.fpfh_descriptor is None or b.fpfh_descriptor is None:
+        return 0.5
+    norm_a = np.linalg.norm(a.fpfh_descriptor)
+    norm_b = np.linalg.norm(b.fpfh_descriptor)
+    if norm_a < 1e-8 or norm_b < 1e-8:
+        return 0.5
+    cos_sim = float(np.dot(a.fpfh_descriptor, b.fpfh_descriptor) / (norm_a * norm_b))
+    return 0.5 * (1.0 - cos_sim)
+
+
+def height_cost(a: NodeFeatures, b: NodeFeatures) -> float:
+    """Cost from height range overlap.
+
+    Objects at similar heights are more likely to be the same instance.
+    Returns 0 for perfect overlap, 1 for no overlap at all.
+    """
+    if a.height_range is None or b.height_range is None:
+        return 0.5
+    a_min, a_max = a.height_range
+    b_min, b_max = b.height_range
+    a_span = max(a_max - a_min, 0.01)
+    b_span = max(b_max - b_min, 0.01)
+    overlap = max(0, min(a_max, b_max) - max(a_min, b_min))
+    union = max(a_max, b_max) - min(a_min, b_min)
+    if union < 1e-6:
+        return 0.0
+    iou = overlap / union
+    return 1.0 - float(iou)
+
+
+def bbox_extent_cost(a: NodeFeatures, b: NodeFeatures) -> float:
+    """Cost from oriented bounding box dimension similarity.
+
+    Compares sorted OBB extents (length, width, height).
+    Objects with similar physical dimensions are more likely matches.
+    """
+    if a.bbox_extent is None or b.bbox_extent is None:
+        return 0.5
+    diff = np.abs(a.bbox_extent - b.bbox_extent)
+    avg = 0.5 * (np.abs(a.bbox_extent) + np.abs(b.bbox_extent)) + 1e-6
+    rel_diff = (diff / avg).mean()
+    return float(min(rel_diff, 1.0))
+
+
+def dominant_color_cost(a: NodeFeatures, b: NodeFeatures) -> float:
+    """Cost from dominant color cluster comparison.
+
+    Computes min-distance matching between k dominant color centroids.
+    Uses Earth Mover's style greedy assignment in HSV space.
+    """
+    if a.dominant_colors is None or b.dominant_colors is None:
+        return 0.5
+    if len(a.dominant_colors) == 0 or len(b.dominant_colors) == 0:
+        return 0.5
+    # Compute pairwise distances between color centroids
+    ka, kb = len(a.dominant_colors), len(b.dominant_colors)
+    total_dist = 0.0
+    count = 0
+    for i in range(ka):
+        min_d = float('inf')
+        for j in range(kb):
+            d = float(np.linalg.norm(a.dominant_colors[i] - b.dominant_colors[j]))
+            min_d = min(min_d, d)
+        total_dist += min_d
+        count += 1
+    if count == 0:
+        return 0.5
+    # Max possible HSV distance is sqrt(3) ≈ 1.73 (all dims in [0,1])
+    mean_dist = total_dist / count
+    return float(min(mean_dist / 1.0, 1.0))  # normalize to [0, 1]
+
+
 # ---------------------------------------------------------------------------
 # Cost matrix & Hungarian assignment
 # ---------------------------------------------------------------------------
 
 @dataclass
 class MatchWeights:
-    """Weights for combining cost components (11 components).
+    """Weights for combining cost components (16 components).
 
-    Two presets available via `MatchWeights.preset()`:
+    Three presets available via `MatchWeights.preset()`:
       - "static"  — spatial position is primary signal (objects don't move)
       - "dynamic" — identity + neighborhood is primary signal (objects may move)
+    
+    Original 11 components + 5 new (fpfh, height, bbox_extent, dominant_color, clip_stability).
+    New components gracefully degrade to 0.5 (neutral) on old PKL files.
     """
-    w_spatial: float = 0.20
-    w_color: float = 0.15
-    w_nch: float = 0.10
-    w_clip_visual: float = 0.10
-    w_neighbor_clip: float = 0.06
-    w_snapshot: float = 0.08
-    w_label: float = 0.06
-    w_shape: float = 0.04
+    w_spatial: float = 0.18
+    w_color: float = 0.12
+    w_nch: float = 0.08
+    w_clip_visual: float = 0.09
+    w_neighbor_clip: float = 0.05
+    w_snapshot: float = 0.07
+    w_label: float = 0.05
+    w_shape: float = 0.03
     w_clip_text: float = 0.03
-    w_room: float = 0.10
-    w_rel_hist: float = 0.08
+    w_room: float = 0.08
+    w_rel_hist: float = 0.06
+    # Phase 1-3 new components
+    w_fpfh: float = 0.05
+    w_height: float = 0.04
+    w_bbox_extent: float = 0.03
+    w_dominant_color: float = 0.02
+    w_clip_stability: float = 0.02      # bonus for stable-appearance matches
     unmatched_cost: float = 0.42
     scene_scale: float = 5.0
     max_match_dist: float = -1.0   # hard spatial gate (m); <0 = auto
@@ -837,25 +1003,27 @@ class MatchWeights:
     @staticmethod
     def preset(mode: str) -> 'MatchWeights':
         if mode == "static":
-            # Position: 30%, Neighborhood+Relations: 22%, Identity: 48%
+            # Position: ~28%, Neighborhood+Relations: ~19%, Identity: ~53%
             return MatchWeights(
-                w_spatial=0.18, w_color=0.14, w_nch=0.09,
-                w_clip_visual=0.10, w_neighbor_clip=0.06,
-                w_snapshot=0.11, w_label=0.06, w_shape=0.05,
-                w_clip_text=0.03, w_room=0.12,
-                w_rel_hist=0.06,
+                w_spatial=0.16, w_color=0.11, w_nch=0.07,
+                w_clip_visual=0.09, w_neighbor_clip=0.05,
+                w_snapshot=0.09, w_label=0.05, w_shape=0.04,
+                w_clip_text=0.03, w_room=0.10,
+                w_rel_hist=0.05,
+                w_fpfh=0.05, w_height=0.04, w_bbox_extent=0.03,
+                w_dominant_color=0.02, w_clip_stability=0.02,
                 unmatched_cost=0.42,
                 max_match_dist=5.0)
         elif mode == "dynamic":
-            # Position: 18%, Neighborhood+Relations: 28%, Identity: 54%
-            # Spatial boosted from 4%→10% to prevent wrong-instance matches
-            # among dense same-category clusters (e.g. 154 windows in bedroom)
+            # Position: ~16%, Neighborhood+Relations: ~24%, Identity: ~60%
             return MatchWeights(
-                w_spatial=0.10, w_color=0.18, w_nch=0.10,
-                w_clip_visual=0.13, w_neighbor_clip=0.07,
-                w_snapshot=0.10, w_label=0.06, w_shape=0.04,
-                w_clip_text=0.04, w_room=0.08,
-                w_rel_hist=0.10,
+                w_spatial=0.08, w_color=0.14, w_nch=0.08,
+                w_clip_visual=0.11, w_neighbor_clip=0.06,
+                w_snapshot=0.08, w_label=0.05, w_shape=0.03,
+                w_clip_text=0.03, w_room=0.06,
+                w_rel_hist=0.08,
+                w_fpfh=0.06, w_height=0.04, w_bbox_extent=0.04,
+                w_dominant_color=0.03, w_clip_stability=0.03,
                 unmatched_cost=0.38,
                 max_match_dist=8.0)
         else:
@@ -949,6 +1117,13 @@ def build_cost_matrix(feats_1: list, feats_2: list,
             c_nch = neighbor_category_cost(fa, fb)
             c_nclip = neighbor_clip_cost(fa, fb)
             c_rh = relation_hist_cost(fa, fb)
+            # Phase 1-3 new components
+            c_fpfh = fpfh_cost(fa, fb)
+            c_ht = height_cost(fa, fb)
+            c_bext = bbox_extent_cost(fa, fb)
+            c_dcol = dominant_color_cost(fa, fb)
+            # Clip stability bonus: reduce cost when both objects are stable
+            stability_bonus = 0.5 * (1.0 - min(fa.clip_ft_stability, fb.clip_ft_stability))
 
             cost[i, j] = (weights.w_clip_visual * c_vis +
                           weights.w_spatial * c_spa +
@@ -960,7 +1135,12 @@ def build_cost_matrix(feats_1: list, feats_2: list,
                           weights.w_shape * c_shape +
                           weights.w_nch * c_nch +
                           weights.w_neighbor_clip * c_nclip +
-                          weights.w_rel_hist * c_rh)
+                          weights.w_rel_hist * c_rh +
+                          weights.w_fpfh * c_fpfh +
+                          weights.w_height * c_ht +
+                          weights.w_bbox_extent * c_bext +
+                          weights.w_dominant_color * c_dcol +
+                          weights.w_clip_stability * stability_bonus)
 
     elapsed = time.time() - t0
     gated_pct = 100 * n_gated / total_cells if total_cells else 0
@@ -2012,6 +2192,11 @@ def main():
     parser.add_argument('--w-clip-text', type=float, default=None)
     parser.add_argument('--w-room', type=float, default=None)
     parser.add_argument('--w-rel-hist', type=float, default=None)
+    parser.add_argument('--w-fpfh', type=float, default=None)
+    parser.add_argument('--w-height', type=float, default=None)
+    parser.add_argument('--w-bbox-extent', type=float, default=None)
+    parser.add_argument('--w-dominant-color', type=float, default=None)
+    parser.add_argument('--w-clip-stability', type=float, default=None)
     parser.add_argument('--unmatched-cost', type=float, default=None)
     parser.add_argument('--scene-scale', type=float, default=-1.0,
                         help='Scene scale in meters (-1 = auto from data)')
@@ -2039,6 +2224,10 @@ def main():
                        ('w_label', 'w_label'), ('w_shape', 'w_shape'),
                        ('w_clip_text', 'w_clip_text'), ('w_room', 'w_room'),
                        ('w_rel_hist', 'w_rel_hist'),
+                       ('w_fpfh', 'w_fpfh'), ('w_height', 'w_height'),
+                       ('w_bbox_extent', 'w_bbox_extent'),
+                       ('w_dominant_color', 'w_dominant_color'),
+                       ('w_clip_stability', 'w_clip_stability'),
                        ('unmatched_cost', 'unmatched_cost')]:
         val = getattr(args, flag)
         if val is not None:
@@ -2048,10 +2237,13 @@ def main():
         weights.max_match_dist = args.max_match_dist
     rel_pct = weights.w_rel_hist
     neigh_pct = weights.w_nch + weights.w_neighbor_clip + rel_pct
-    pos_pct = weights.w_spatial + weights.w_room
-    id_pct = 1.0 - pos_pct - neigh_pct
+    pos_pct = weights.w_spatial + weights.w_room + weights.w_height
+    snap_pct = weights.w_snapshot
+    geo_pct = weights.w_fpfh + weights.w_bbox_extent
+    id_pct = 1.0 - pos_pct - neigh_pct - snap_pct - geo_pct
     print(f"[{_ts()}] Mode: {args.mode} | Position: {pos_pct:.0%} | "
           f"Neighborhood: {neigh_pct:.0%} (rel_hist: {rel_pct:.0%}) | "
+          f"Geometry: {geo_pct:.0%} | "
           f"Identity: {id_pct:.0%} | "
           f"Refine iters: {args.refine_iters}")
 
@@ -2286,11 +2478,14 @@ def main():
     # ---- Config footer ----
     rel_pct = weights.w_rel_hist
     neigh_pct = weights.w_nch + weights.w_neighbor_clip + rel_pct
-    pos_pct = weights.w_spatial + weights.w_room
-    id_pct = 1.0 - pos_pct - neigh_pct
+    pos_pct = weights.w_spatial + weights.w_room + weights.w_height
+    snap_pct = weights.w_snapshot
+    geo_pct = weights.w_fpfh + weights.w_bbox_extent
+    id_pct = 1.0 - pos_pct - neigh_pct - snap_pct - geo_pct
     print(f"\n  Config:")
     print(f"  {'Weight split':<28s}  Position {pos_pct:.0%} | "
           f"Neighborhood {neigh_pct:.0%} (rel_hist: {rel_pct:.0%}) | "
+          f"Geometry {geo_pct:.0%} | "
           f"Snapshot {weights.w_snapshot:.0%} | Identity {id_pct:.0%}")
     print(f"  {'Thresholds':<28s}  same_dist≤{thresholds.same_dist_max}m  "
           f"same_clip≥{thresholds.same_clip_min}  "

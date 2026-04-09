@@ -148,9 +148,27 @@ class Edge():
         self.snapshot_step = None        # navigate_steps when captured
         self.snapshot_bboxes = None      # dict with 'node1': [x1,y1,x2,y2], 'node2': [x1,y1,x2,y2]
         self.snapshot_clip_features = None  # np.ndarray (1, D) CLIP embedding of the snapshot
+        # Edge enrichment fields for cross-run matching
+        self.distance_3d = None          # float: 3D Euclidean distance between node centroids
+        self.height_diff = None          # float: signed height difference (node1.z - node2.z)
+        self.n_co_observations = 1       # int: how many frames showed both objects
 
     def set_relation(self, relation):
         self.relation = relation
+
+    def compute_spatial_metrics(self):
+        """Compute 3D distance and height difference between connected nodes.
+        
+        Uses point cloud centroids when available, falls back to 2D center.
+        """
+        try:
+            c1 = np.asarray(self.node1.object['pcd'].get_center())
+            c2 = np.asarray(self.node2.object['pcd'].get_center())
+            self.distance_3d = float(np.linalg.norm(c1 - c2))
+            self.height_diff = float(c1[2] - c2[2])
+        except Exception:
+            self.distance_3d = None
+            self.height_diff = None
 
     def set_snapshot(self, image, frame_idx=None, step=None, bboxes=None,
                      clip_features=None):
@@ -774,7 +792,8 @@ Object pair(s):
             trans_pose = self.pose_matrix,
             class_names = self.classes,
             BG_CLASSES = self.BG_CLASSES,
-            is_navigation = self.is_navigation
+            is_navigation = self.is_navigation,
+            navigate_step = getattr(self, 'navigate_steps', None),
             # color_path = color_path,
         )
         
@@ -921,6 +940,7 @@ Object pair(s):
                 response = self.get_vlm_response(prompt=prompt, image=image)
                 response = response.replace('.', '').lower()
                 new_edge.set_relation(response)
+                new_edge.compute_spatial_metrics()
                 # Capture memory snapshot
                 if self.store_edge_snapshots:
                     step = getattr(self, 'navigate_steps', None)
@@ -946,6 +966,7 @@ Object pair(s):
             if len(relations) == len(new_edges):
                 for i, relation in enumerate(relations):
                     new_edges[i].set_relation(relation)
+                    new_edges[i].compute_spatial_metrics()
             # discriminate all relation proposals
             self.free_map = self.fbe_free_map.cpu().numpy()[0,0,::-1].copy() > 0.5
             for i, new_edge in enumerate(new_edges):
@@ -1235,8 +1256,10 @@ Object pair(s):
                 obj['mask'] = [np.array(m, dtype=bool) if isinstance(m, list) else m for m in v]
             elif k == 'inst_color':
                 obj[k] = np.array(v) if isinstance(v, list) else v
-            elif k in ('clip_ft', 'text_ft'):
+            elif k in ('clip_ft', 'text_ft', 'clip_ft_variance', 'clip_ft_mean_sq'):
                 obj[k] = torch.tensor(v) if isinstance(v, list) else v
+            elif k == 'height_range' and isinstance(v, list):
+                obj[k] = tuple(v)
             else:
                 obj[k] = v
         # Reconstruct open3d objects
@@ -1293,6 +1316,9 @@ Object pair(s):
                         'node1_idx': idx1,
                         'node2_idx': idx2,
                         'relation': edge.relation,
+                        'distance_3d': edge.distance_3d,
+                        'height_diff': edge.height_diff,
+                        'n_co_observations': getattr(edge, 'n_co_observations', 1),
                     }
                     # Serialize memory snapshot
                     if edge.has_snapshot:
@@ -1393,6 +1419,10 @@ Object pair(s):
             n2 = self.nodes[s_edge['node2_idx']]
             edge = Edge(n1, n2)  # auto-adds to both nodes
             edge.set_relation(s_edge['relation'])
+            # Restore edge enrichment fields
+            edge.distance_3d = s_edge.get('distance_3d')
+            edge.height_diff = s_edge.get('height_diff')
+            edge.n_co_observations = s_edge.get('n_co_observations', 1)
             # Restore memory snapshot
             if 'snapshot_b64' in s_edge:
                 img_bytes = base64.b64decode(s_edge['snapshot_b64'])
