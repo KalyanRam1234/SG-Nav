@@ -113,6 +113,7 @@ class MatchReport:
     edge_consistency_global: float
     edge_consistency_soft: float
     edge_consistency_detail: dict       # EdgeConsistencyReport as dict
+    accuracy: dict                       # MatchAccuracyReport as dict
     summary: dict
 
 
@@ -1347,6 +1348,242 @@ def compute_edge_relation_accuracy(match_map: dict, edges_1: list,
 
 
 # ---------------------------------------------------------------------------
+# Match Accuracy Score (MAS)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MatchAccuracyReport:
+    """Comprehensive match accuracy evaluation using held-out / independent signals."""
+    # 1. Category agreement
+    category_exact: float          # fraction with identical labels
+    category_fuzzy: float          # fraction with substring/exact labels
+    n_matches: int
+
+    # 2. Spatial proximity (for SAME matches only)
+    spatial_within_05m: float      # fraction within 0.5m
+    spatial_within_1m: float       # fraction within 1.0m
+    spatial_within_2m: float       # fraction within 2.0m
+    spatial_mean: float            # mean distance (m)
+    spatial_median: float          # median distance (m)
+    n_same: int
+
+    # 3. Room agreement
+    room_agreement: float          # fraction with matching room types
+    n_with_room: int               # pairs where both have room info
+
+    # 4. Neighbor category overlap (Jaccard)
+    neighbor_jaccard_mean: float   # mean Jaccard of neighbor category sets
+    neighbor_jaccard_median: float
+    n_with_neighbors: int
+
+    # 5. Reciprocal consistency
+    reciprocal_rate: float         # top-1: B's best CLIP match among matched SG1 is A
+    reciprocal_topk: float         # top-k: A in B's top-k CLIP matches
+    reciprocal_k: int              # k used for top-k
+    n_reciprocal_checked: int
+
+    # 6. Composite Match Accuracy Score (weighted combination)
+    score: float                   # 0-1, higher is better
+
+
+def compute_match_accuracy(
+    matches: list,
+    feats_1: List[NodeFeatures],
+    feats_2: List[NodeFeatures],
+    edges_1: list,
+    edges_2: list,
+) -> MatchAccuracyReport:
+    """Evaluate match quality using multiple independent signals.
+
+    The key idea: validate matches using signals that were either NOT used
+    or used with low weight in the cost matrix, providing an independent
+    accuracy estimate without ground truth.
+    """
+    if not matches:
+        return MatchAccuracyReport(
+            category_exact=0, category_fuzzy=0, n_matches=0,
+            spatial_within_05m=0, spatial_within_1m=0, spatial_within_2m=0,
+            spatial_mean=0, spatial_median=0, n_same=0,
+            room_agreement=0, n_with_room=0,
+            neighbor_jaccard_mean=0, neighbor_jaccard_median=0, n_with_neighbors=0,
+            reciprocal_rate=0, reciprocal_topk=0, reciprocal_k=3,
+            n_reciprocal_checked=0, score=0)
+
+    # Build lookup: feature index -> NodeFeatures
+    f1_by_idx = {f.idx: f for f in feats_1}
+    f2_by_idx = {f.idx: f for f in feats_2}
+
+    # Build adjacency: node_idx -> set of neighbor node indices + their captions
+    def _build_adjacency(edges, feats):
+        """node_idx -> set of neighbor captions."""
+        idx_to_caption = {f.idx: f.caption.lower().strip().replace('_', ' ')
+                          for f in feats}
+        adj: Dict[int, set] = defaultdict(set)
+        for e in edges:
+            n1, n2 = e['node1_idx'], e['node2_idx']
+            if n1 in idx_to_caption and n2 in idx_to_caption:
+                adj[n1].add(idx_to_caption[n2])
+                adj[n2].add(idx_to_caption[n1])
+        return adj
+
+    adj_1 = _build_adjacency(edges_1, feats_1)
+    adj_2 = _build_adjacency(edges_2, feats_2)
+
+    # 1. Category agreement
+    n_exact = 0
+    n_fuzzy = 0
+    for m in matches:
+        lsim = _label_similarity(m['sg1_caption'], m['sg2_caption'])
+        if lsim >= 1.0:
+            n_exact += 1
+            n_fuzzy += 1
+        elif lsim >= 0.5:
+            n_fuzzy += 1
+
+    n_matches = len(matches)
+    cat_exact = n_exact / n_matches
+    cat_fuzzy = n_fuzzy / n_matches
+
+    # 2. Spatial proximity (SAME matches only, using 3D GPS/centroid distance)
+    same_matches = [m for m in matches if m['change_type'] == 'SAME']
+    same_dists = [m['spatial_dist_3d'] for m in same_matches]
+    n_same = len(same_matches)
+
+    if n_same > 0:
+        sp_05 = sum(1 for d in same_dists if d <= 0.5) / n_same
+        sp_1 = sum(1 for d in same_dists if d <= 1.0) / n_same
+        sp_2 = sum(1 for d in same_dists if d <= 2.0) / n_same
+        sp_mean = float(np.mean(same_dists))
+        sp_median = float(np.median(same_dists))
+    else:
+        sp_05 = sp_1 = sp_2 = sp_mean = sp_median = 0.0
+
+    # 3. Room agreement
+    n_room_agree = 0
+    n_with_room = 0
+    for m in matches:
+        if m.get('sg1_room') and m.get('sg2_room'):
+            n_with_room += 1
+            if m['sg1_room'] == m['sg2_room']:
+                n_room_agree += 1
+    room_agree = n_room_agree / max(n_with_room, 1)
+
+    # 4. Neighbor category overlap (Jaccard index)
+    # For each match (A→B), compare the set of category labels of A's
+    # neighbors in SG1 vs B's neighbors in SG2. This is a structural
+    # signal independent of the CLIP/color features used in matching.
+    jaccards = []
+    for m in matches:
+        sg1_idx = m['sg1_idx']
+        sg2_idx = m['sg2_idx']
+        neigh_cats_1 = adj_1.get(sg1_idx, set())
+        neigh_cats_2 = adj_2.get(sg2_idx, set())
+        if neigh_cats_1 or neigh_cats_2:
+            union = neigh_cats_1 | neigh_cats_2
+            inter = neigh_cats_1 & neigh_cats_2
+            jacc = len(inter) / len(union) if union else 0.0
+            jaccards.append(jacc)
+
+    n_with_neigh = len(jaccards)
+    jacc_mean = float(np.mean(jaccards)) if jaccards else 0.0
+    jacc_median = float(np.median(jaccards)) if jaccards else 0.0
+
+    # 5. Reciprocal consistency
+    # For each match A→B, find B's nearest same-category CLIP matches among
+    # only the MATCHED SG1 nodes (not all 1509). Check if A is in B's top-k.
+    # Restricting to matched nodes removes distortion from the many unmatched
+    # SG1 nodes in asymmetric graphs (e.g., 1509 vs 590).
+    # Uses ONLY CLIP visual — an independent validation signal.
+    RECIPROCAL_K = 3
+
+    matched_sg1_idxs = {m['sg1_idx'] for m in matches}
+    matched_f1 = [f for f in feats_1 if f.idx in matched_sg1_idxs]
+    f1m_clip = np.array([f.clip_ft for f in matched_f1])
+    f1m_norms = np.linalg.norm(f1m_clip, axis=1, keepdims=True)
+    f1m_norms = np.maximum(f1m_norms, 1e-8)
+    f1m_clip_normed = f1m_clip / f1m_norms
+
+    n_recip_top1 = 0
+    n_recip_topk = 0
+    n_recip_checked = 0
+    for m in matches:
+        sg1_idx = m['sg1_idx']
+        sg2_idx = m['sg2_idx']
+        fb = f2_by_idx.get(sg2_idx)
+        if fb is None:
+            continue
+
+        b_clip = fb.clip_ft / max(np.linalg.norm(fb.clip_ft), 1e-8)
+        b_cat = fb.caption.lower().strip().replace('_', ' ')
+
+        # Score against matched SG1 nodes of same category
+        scored = []
+        for pos, f1 in enumerate(matched_f1):
+            f1_cat = f1.caption.lower().strip().replace('_', ' ')
+            if _label_similarity(b_cat, f1_cat) == 0.0:
+                continue
+            sim = float(np.dot(b_clip, f1m_clip_normed[pos]))
+            scored.append((sim, f1.idx))
+
+        if not scored:
+            continue
+        n_recip_checked += 1
+        scored.sort(reverse=True)
+
+        if scored[0][1] == sg1_idx:
+            n_recip_top1 += 1
+        if sg1_idx in {idx for _, idx in scored[:RECIPROCAL_K]}:
+            n_recip_topk += 1
+
+    recip_top1 = n_recip_top1 / max(n_recip_checked, 1)
+    recip_topk = n_recip_topk / max(n_recip_checked, 1)
+
+    # 6. Composite Match Accuracy Score
+    # Weighted blend of the 5 sub-scores, emphasizing the most
+    # independent signals (reciprocal, neighbor Jaccard, spatial).
+    # Category agreement is expected ~100% (enforced by matching), low weight.
+    w_cat = 0.05
+    w_spatial = 0.25       # strongest ground-truth signal for static scenes
+    w_room = 0.15
+    w_neighbor = 0.25      # structural/topological — independent of cost matrix
+    w_reciprocal = 0.30    # purely independent CLIP-based validation
+
+    cat_score = cat_exact   # use exact, not fuzzy
+    spatial_score = sp_1 if n_same > 0 else 0.0   # % within 1m
+    room_score = room_agree
+    neighbor_score = jacc_mean
+    reciprocal_score = recip_topk  # top-k is fairer than top-1 for dense categories
+
+    composite = (w_cat * cat_score +
+                 w_spatial * spatial_score +
+                 w_room * room_score +
+                 w_neighbor * neighbor_score +
+                 w_reciprocal * reciprocal_score)
+
+    return MatchAccuracyReport(
+        category_exact=round(cat_exact, 4),
+        category_fuzzy=round(cat_fuzzy, 4),
+        n_matches=n_matches,
+        spatial_within_05m=round(sp_05, 4),
+        spatial_within_1m=round(sp_1, 4),
+        spatial_within_2m=round(sp_2, 4),
+        spatial_mean=round(sp_mean, 4),
+        spatial_median=round(sp_median, 4),
+        n_same=n_same,
+        room_agreement=round(room_agree, 4),
+        n_with_room=n_with_room,
+        neighbor_jaccard_mean=round(jacc_mean, 4),
+        neighbor_jaccard_median=round(jacc_median, 4),
+        n_with_neighbors=n_with_neigh,
+        reciprocal_rate=round(recip_top1, 4),
+        reciprocal_topk=round(recip_topk, 4),
+        reciprocal_k=RECIPROCAL_K,
+        n_reciprocal_checked=n_recip_checked,
+        score=round(composite, 4),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Change detection
 # ---------------------------------------------------------------------------
 
@@ -1513,6 +1750,7 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
             edge_consistency_global=0.0,
             edge_consistency_soft=0.0,
             edge_consistency_detail={},
+            accuracy={},
             summary={t.value: 0 for t in ChangeType})
 
     # Auto-compute max_match_dist if not set
@@ -1692,6 +1930,26 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
               f"(fraction of checked SG1 edges < {ec_report.proximity_m}m)")
         print(f"Edge relation accuracy:  {edge_relation_acc:.2%}")
 
+    # Match accuracy evaluation
+    print(f"[{_ts()}] Computing match accuracy score ...")
+    accuracy_report = compute_match_accuracy(
+        matches, feats_1, feats_2,
+        sg1_data['edges'], sg2_data['edges'])
+
+    if verbose:
+        print(f"Match Accuracy Score:    {accuracy_report.score:.2%}")
+        print(f"  Category exact:        {accuracy_report.category_exact:.2%}")
+        print(f"  Spatial ≤1m:           {accuracy_report.spatial_within_1m:.2%} "
+              f"(of {accuracy_report.n_same} SAME)")
+        print(f"  Room agreement:        {accuracy_report.room_agreement:.2%} "
+              f"(of {accuracy_report.n_with_room})")
+        print(f"  Neighbor Jaccard:      {accuracy_report.neighbor_jaccard_mean:.3f} "
+              f"(of {accuracy_report.n_with_neighbors})")
+        print(f"  Reciprocal top-1:      {accuracy_report.reciprocal_rate:.2%} "
+              f"(of {accuracy_report.n_reciprocal_checked})")
+        print(f"  Reciprocal top-{accuracy_report.reciprocal_k}:      "
+              f"{accuracy_report.reciprocal_topk:.2%}")
+
     # Summary
     summary = {t.value: 0 for t in ChangeType}
     for m in matches:
@@ -1708,6 +1966,7 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
         edge_consistency_global=round(ec_report.hard, 4),
         edge_consistency_soft=round(ec_report.soft, 4),
         edge_consistency_detail=asdict(ec_report),
+        accuracy=asdict(accuracy_report),
         summary=summary,
     )
 
@@ -1989,6 +2248,40 @@ def main():
               f"{min(moved_clips):>8.3f} {max(moved_clips):>8.3f}")
         print(f"  {'Color histogram sim':<28s} {_avg(moved_colors):>8.3f} "
               f"{min(moved_colors):>8.3f} {max(moved_colors):>8.3f}")
+
+    # ---- Match Accuracy Score ----
+    acc = report.accuracy
+    if acc:
+        print(f"\n  Match Accuracy Score (MAS):")
+        print(f"  {thin}")
+        mas = acc.get('score', 0)
+        print(f"  {'Composite MAS':<36s} {mas:>25.1%}")
+        print(f"    {'Category exact match':<34s} {acc.get('category_exact', 0):>24.1%}")
+        n_same_acc = acc.get('n_same', 0)
+        if n_same_acc > 0:
+            print(f"    {'Spatial ≤0.5m / ≤1m / ≤2m':<34s} "
+                  f"{acc.get('spatial_within_05m', 0):>5.0%} / "
+                  f"{acc.get('spatial_within_1m', 0):>4.0%} / "
+                  f"{acc.get('spatial_within_2m', 0):>4.0%}"
+                  f"  (of {n_same_acc} SAME)")
+            print(f"    {'Spatial mean / median':<34s} "
+                  f"{acc.get('spatial_mean', 0):>5.2f}m / "
+                  f"{acc.get('spatial_median', 0):.2f}m")
+        print(f"    {'Room agreement':<34s} "
+              f"{acc.get('room_agreement', 0):>24.1%}"
+              f"  ({acc.get('n_with_room', 0)} pairs)")
+        print(f"    {'Neighbor Jaccard (mean/med)':<34s} "
+              f"{acc.get('neighbor_jaccard_mean', 0):>7.3f} / "
+              f"{acc.get('neighbor_jaccard_median', 0):.3f}"
+              f"  ({acc.get('n_with_neighbors', 0)} pairs)")
+        rk = acc.get('reciprocal_k', 3)
+        print(f"    {'Reciprocal (top-1 / top-' + str(rk) + ')':<34s} "
+              f"{acc.get('reciprocal_rate', 0):>5.0%} / "
+              f"{acc.get('reciprocal_topk', 0):>4.0%}"
+              f"  ({acc.get('n_reciprocal_checked', 0)} checked)")
+        # Explain the composite
+        print(f"    {'└ weights: cat 5% spatial 25%':36s} "
+              f"room 15% neighbor 25% reciprocal 30%")
 
     # ---- Config footer ----
     rel_pct = weights.w_rel_hist
