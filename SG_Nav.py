@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 import math
 import os
 from collections import deque
@@ -184,6 +185,16 @@ class SG_Nav_Agent():
         self.frontier_teleport_count = 0
         self.max_frontier_teleports = 5
 
+        # DynamicQA object injection state
+        self._inject_manifest = None
+        self._inject_variant = getattr(args, 'inject_variant', 0)
+        self._inject_record_idx = getattr(args, 'inject_record_idx', None)
+        self._injected_objects = []  # track injected rigid objects
+        if hasattr(args, 'inject_manifest') and args.inject_manifest:
+            self._inject_manifest = self._load_inject_manifest(args.inject_manifest)
+            print(f"[Inject] Loaded manifest with {len(self._inject_manifest)} records "
+                  f"(variant={self._inject_variant}, record_idx={self._inject_record_idx})")
+
         # This is to adjust the experiment
         self.experiment_name = 'experiment_0'
 
@@ -194,6 +205,129 @@ class SG_Nav_Agent():
 
         self.toggle_stuck_handling = True
         print('scene graph module init finish!!!')
+
+    # ── DynamicQA Object Injection ──────────────────────────────────────
+
+    @staticmethod
+    def _load_inject_manifest(path):
+        """Load a JSONL manifest produced by tools.dynamic_qa.build_dataset."""
+        records = []
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+
+    def inject_cad_object(self, template_handle, position, rotation_quat=None, scale=None):
+        """Inject a rigid CAD object into the live Habitat-Sim scene.
+
+        The object is placed as STATIC so it stays fixed during navigation.
+        Returns the Habitat rigid object handle, or None on failure.
+        """
+        try:
+            import magnum as mn
+            import habitat_sim
+        except ImportError:
+            print("[Inject] ERROR: magnum / habitat_sim not importable")
+            return None
+
+        try:
+            sim = self.simulator._env._sim
+            obj_tmpl_mgr = sim.get_object_template_manager()
+            rigid_mgr = sim.get_rigid_object_manager()
+
+            template_ids = obj_tmpl_mgr.load_configs(template_handle)
+            if not template_ids:
+                print(f"[Inject] ERROR: could not load template {template_handle}")
+                return None
+            template_id = template_ids[0]
+            obj = rigid_mgr.add_object_by_template_id(template_id)
+
+            obj.motion_type = habitat_sim.physics.MotionType.STATIC
+            obj.translation = mn.Vector3(*[float(v) for v in position])
+
+            if rotation_quat is not None:
+                # rotation_quat is [x, y, z, w]
+                obj.rotation = mn.Quaternion(
+                    mn.Vector3(float(rotation_quat[0]),
+                               float(rotation_quat[1]),
+                               float(rotation_quat[2])),
+                    float(rotation_quat[3])
+                )
+            if scale is not None:
+                s = float(scale)
+                obj.scale = mn.Vector3(s, s, s)
+
+            self._injected_objects.append(obj)
+            print(f"[Inject] Placed object at {position} (template={template_handle})")
+            return obj
+        except Exception as e:
+            print(f"[Inject] ERROR injecting object: {e}")
+            return None
+
+    def _inject_from_manifest(self):
+        """Match the current episode's scene to the manifest and inject objects.
+
+        Called from reset() after the episode is loaded.
+        """
+        if self._inject_manifest is None:
+            return
+
+        episode = self.simulator._env.current_episode
+        episode_scene = getattr(episode, 'scene_id', '') or ''
+
+        # Determine which manifest records to use
+        if self._inject_record_idx is not None:
+            # Use a specific record
+            idx = int(self._inject_record_idx)
+            if idx < len(self._inject_manifest):
+                records = [self._inject_manifest[idx]]
+            else:
+                print(f"[Inject] WARNING: record_idx {idx} out of range "
+                      f"(manifest has {len(self._inject_manifest)} records)")
+                return
+        else:
+            # Auto-match by scene_handle
+            records = [r for r in self._inject_manifest
+                       if self._scene_matches(r.get('scene_handle', ''), episode_scene)]
+            if not records:
+                print(f"[Inject] No manifest records match scene {episode_scene}")
+                return
+
+        variant_idx = int(self._inject_variant)
+        for record in records:
+            placements = record.get('validPlacements', [])
+            if variant_idx >= len(placements):
+                print(f"[Inject] WARNING: variant {variant_idx} not in placements "
+                      f"(have {len(placements)})")
+                continue
+            placement = placements[variant_idx]
+            template = record.get('template_handle', '')
+            position = placement.get('position', [0, 0, 0])
+            rotation = placement.get('rotation', None)
+            cat = record.get('object_category', 'unknown')
+            print(f"[Inject] Injecting '{cat}' variant={variant_idx} into scene")
+            self.inject_cad_object(template, position, rotation)
+
+    @staticmethod
+    def _scene_matches(manifest_scene, episode_scene):
+        """Check if a manifest scene_handle matches the episode's scene_id.
+
+        Compares the scene directory name (e.g. '2azQ1b91cZZ') since paths
+        may differ between generation and runtime environments.
+        """
+        if not manifest_scene or not episode_scene:
+            return False
+        # Extract the scene directory component (e.g. '2azQ1b91cZZ')
+        m_parts = manifest_scene.replace('\\', '/').split('/')
+        e_parts = episode_scene.replace('\\', '/').split('/')
+        # Compare last directory-like component (before .glb)
+        m_key = [p for p in m_parts if p and not p.endswith('.glb')]
+        e_key = [p for p in e_parts if p and not p.endswith('.glb')]
+        if m_key and e_key:
+            return m_key[-1] == e_key[-1]
+        return manifest_scene in episode_scene or episode_scene in manifest_scene
 
     def add_predicates(self, model):
         predicate = Predicate('IsNearObj', closed = True, size = 2)
@@ -310,6 +444,10 @@ class SG_Nav_Agent():
         self.frontier_teleport_count = 0
 
         self.scenegraph.reset()
+
+        # Inject CAD objects from DynamicQA manifest (if configured)
+        self._injected_objects.clear()
+        self._inject_from_manifest()
         
     def reset_local_scenegraph(self):
         """Reset only the local scene graph after finding a goal object"""
@@ -819,8 +957,14 @@ class SG_Nav_Agent():
         
         if self.navigate_steps == 0:
             print(f"[Act] Initialize goal probabilities for: {self.obj_goal}")
-            self.prob_array_room = self.co_occur_room_mtx[self.goal_idx[self.obj_goal]]
-            self.prob_array_obj = self.co_occur_mtx[self.goal_idx[self.obj_goal]]
+            if self.obj_goal in self.goal_idx and self.goal_idx[self.obj_goal] < self.num_cooccur_objects:
+                self.prob_array_room = self.co_occur_room_mtx[self.goal_idx[self.obj_goal]]
+                self.prob_array_obj = self.co_occur_mtx[self.goal_idx[self.obj_goal]]
+            else:
+                # Unknown goal category — use uniform prior (no co-occurrence bias)
+                print(f"[Act] WARNING: '{self.obj_goal}' not in co-occurrence matrices, using uniform prior")
+                self.prob_array_room = np.ones(self.co_occur_room_mtx.shape[1]) / self.co_occur_room_mtx.shape[1]
+                self.prob_array_obj = np.ones(self.num_cooccur_objects) / float(self.num_cooccur_objects)
 
         print(f"[Act] Processing observations - depth clipping...")
         observations["depth"][observations["depth"]==0.5] = 100 # don't construct unprecise map with distance less than 0.5 m
@@ -1923,6 +2067,19 @@ def main():
     parser.add_argument(
         "--reserve_gpu_gb", default=15, type=float,
         help="Pre-reserve GPU memory in GB to prevent other processes from claiming it"
+    )
+    # DynamicQA object injection arguments
+    parser.add_argument(
+        "--inject_manifest", default=None, type=str,
+        help="Path to DynamicQA JSONL manifest for physics-based object injection"
+    )
+    parser.add_argument(
+        "--inject_variant", default=0, type=int,
+        help="Which placement variant to use from manifest (0=A, 1=B)"
+    )
+    parser.add_argument(
+        "--inject_record_idx", default=None, type=int,
+        help="Inject a specific record index from the manifest (default: auto-match by scene)"
     )
     args = parser.parse_args()
     _reserve_gpu_memory(args.reserve_gpu_gb)

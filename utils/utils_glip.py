@@ -24,15 +24,20 @@ with open('tools/matterport_category_mappings.tsv') as file:
             categories_40.append(line_[-1])
 
 # Base categories: original 21 ObjectNav + 10 extended scene-graph categories
+#                  + cup + 9 DynamicQA small/dynamic objects
+# Indices 0-30: original categories (in co-occurrence matrices since v1)
+# Indices 31-40: cup + DynamicQA objects (co-occurrence via proxy expansion)
 categories_21 = [
     'chair', 'table', 'picture', 'cabinet', 'cushion', 'sofa',
     'bed', 'chest_of_drawers', 'plant', 'sink', 'toilet', 'stool',
     'towel', 'tv_monitor', 'shower', 'bathtub', 'counter', 'fireplace',
     'gym_equipment', 'seating', 'clothes',
     'lamp', 'mirror', 'rug', 'curtain', 'shelf', 'desk',
-    'door', 'window', 'cushion pillow', 'blanket', 'cup'
+    'door', 'window', 'cushion pillow', 'blanket',
+    # DynamicQA objects (indices 31-40, co-occurrence expanded via proxy)
+    'cup', 'phone', 'remote', 'laptop', 'book', 'mug', 'bottle', 'plate', 'bowl', 'keys',
 ]
-NUM_BASE_CATEGORIES = len(categories_21)  # 31
+NUM_BASE_CATEGORIES = len(categories_21)  # 41
 
 # Extra GLIP detection targets (not indexed in co-occurrence matrices)
 categories_21.append('heater')

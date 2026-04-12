@@ -276,9 +276,14 @@ class SceneGraph():
         self.max_detections_per_object = 10
         
         self.threshold_list = {'bathtub': 1, 'bed': 3, 'cabinet': 2, 'chair': 2, 'chest_of_drawers': 2, 'clothes': 4, 'counter': 2, 'cushion': 3, 'fireplace': 2, 'gym_equipment': 3, 'picture': 4, 'plant': 2, 'seating': 1, 'shower': 1, 'sink': 2, 'sofa': 4, 'stool': 2, 'table': 3, 'toilet': 2, 'towel': 2, 'tv_monitor': 1, 'treadmill': 2, 'fitness equipment': 2,
-            'lamp': 2, 'mirror': 2, 'rug': 2, 'curtain': 2, 'shelf': 2, 'desk': 2, 'door': 2, 'window': 2, 'pillow': 2, 'blanket': 2}
+            'lamp': 2, 'mirror': 2, 'rug': 2, 'curtain': 2, 'shelf': 2, 'desk': 2, 'door': 2, 'window': 2, 'pillow': 2, 'blanket': 2,
+            # DynamicQA small/dynamic objects — low thresholds since they're small
+            'phone': 1, 'cell phone': 1, 'remote': 1, 'tv remote': 1, 'laptop': 1,
+            'book': 1, 'keys': 1, 'mug': 1, 'cup': 1, 'bottle': 1, 'plate': 1, 'bowl': 1}
         self.small_objects = ['bathtub', 'chest_of_drawers', 'cushion', 'plant', 'seating', 'shower', 'toilet', 'tv_monitor',
-            'lamp', 'mirror', 'pillow', 'blanket']
+            'lamp', 'mirror', 'pillow', 'blanket',
+            # DynamicQA small/dynamic objects
+            'phone', 'cell phone', 'remote', 'tv remote', 'laptop', 'book', 'keys', 'mug', 'cup', 'bottle', 'plate', 'bowl']
         self.store_edge_snapshots = True  # set False to disable memory snapshots on edges
         self.found_goal_times_threshold = 1
         self.N_max = 10
