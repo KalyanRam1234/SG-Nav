@@ -19,7 +19,7 @@ from segment_anything import SamAutomaticMaskGenerator, SamPredictor, sam_model_
 from GroundingDINO.groundingdino.datasets import transforms as T
 from transformers import CLIPModel, CLIPProcessor
 
-from utils.utils_scenegraph.mapping import compute_spatial_similarities, compute_visual_similarities, aggregate_similarities, merge_detections_to_objects
+from utils.utils_scenegraph.mapping import compute_spatial_similarities, compute_visual_similarities, aggregate_similarities, merge_detections_to_objects, dedup_detections, periodic_merge_objects
 from utils.utils_scenegraph.slam_classes import MapObjectList
 from utils.utils_scenegraph.utils import filter_objects, gobs_to_detection_list, text2value
 from utils.utils_scenegraph.grounded_sam_demo import get_grounding_output, load_image, load_model
@@ -807,6 +807,10 @@ Object pair(s):
             return
             
         if len(self.objects) == 0:
+            # Dedup detections within this frame before adding
+            fg_detection_list = dedup_detections(
+                self.cfg, fg_detection_list,
+                centroid_thresh=0.5, visual_thresh=0.5)
             # Add all detections to the map
             for i in range(len(fg_detection_list)):
                 self.objects.append(fg_detection_list[i])
@@ -1052,6 +1056,18 @@ Object pair(s):
             self.get_caption()
             self.update_node()
             self.update_edge()
+
+        # Periodic dedup pass every merge_interval steps (default 20)
+        merge_interval = getattr(self.cfg, 'merge_interval', 20)
+        if (self.navigate_steps > 0 and
+                self.navigate_steps % merge_interval == 0 and
+                len(self.objects) > 1):
+            prev_count = len(self.objects)
+            self.objects = periodic_merge_objects(
+                self.cfg, self.objects,
+                centroid_thresh=0.5, visual_thresh=0.6)
+            if len(self.objects) < prev_count:
+                self.objects_post = filter_objects(self.cfg, self.objects)
     
         # Strip heavy data from old segment2d entries
         self._compact_old_segment2d_results()
