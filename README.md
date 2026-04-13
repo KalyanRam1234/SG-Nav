@@ -130,3 +130,39 @@ python SG_Nav.py --visualize
       year={2024}
 }
 ```
+
+
+python -m tools.dynamic_qa.build_dataset \
+     --sg_pkl /home/kalyan/20-Credits/SG-Nav/data/scenegraph_saves/experiment_0/[0:11]/latest-run-with-memorysnapshots-global_sg_episode_end_20260311_070905.pkl \
+     --cad_category cup \
+     --cad_template_handle /home/kalyan/20-Credits/SG-Nav/data/scene_datasets/objects/example_objects/cup.object_config.json \
+     --output data/dynamicqa/manifest.jsonl \
+     --scene_handle /home/kalyan/20-Credits/SG-Nav/data/MatterPort3D/mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb \
+     --qa_mode llm --qa_count 40 --llm_temperature 0.2 --verbose --llm_progress
+
+
+cd /home/kalyan/20-Credits/SG-Nav && python -m tools.visualize_sg_match \
+   --sg1 data/usefulruns/latest-run-1Initial_run-global_sg_episode_end_20260324_131404.pkl \
+   --sg2 data/usefulruns/latest-run-2-global_sg_episode_end_20260408_033405.pkl \
+   --mode dynamic --refine-iters 2 \
+   -o tools/sg_match_large_viz.html
+
+ python -m tools.dynamic_qa.build_dataset \
+   --sg_pkl data/usefulruns/1-global_sg_goal_chair_1_found_20260316_232325.pkl \
+   --cad_category cup \
+   --cad_template_handle /home/kalyan/20-Credits/SG-Nav/data/scene_datasets/objects/example_objects/cup.object_config.json \
+   --scene_handle /home/kalyan/20-Credits/SG-Nav/data/MatterPort3D/mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb \
+   --output data/dynamicqa/manifest.jsonl \
+   --verbose --run_physics
+
+ python SG_Nav.py \
+   --inject_manifest data/dynamicqa/manifest.jsonl \
+   --inject_variant 0 \
+   --inject_record_idx 0 \
+   --frontier_teleport \
+   --visualize
+
+ cd /home/kalyan/20-Credits/SG-Nav && python -m tools.sg_match \
+  --sg1 data/usefulruns/runs-with-enhanced-sg/global_sg_goal_sofa_3_found_20260411_083018.pkl \
+  --sg2 data/usefulruns/runs-with-enhanced-sg/global_sg_goal_picture_7_found_20260413_100013.pkl \
+  --mode dynamic --refine-iters 2 --verbose 2>&1 | tail -80

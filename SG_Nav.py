@@ -164,7 +164,7 @@ class SG_Nav_Agent():
         self.global_scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self, is_global=True)
 
         self.target_objects_list = [
-            'chair', 'table', 'sofa', 'cabinet', 'plant', 'lamp', 'picture', 'shower',
+            'cup', 'chair', 'table', 'sofa', 'cabinet', 'plant', 'lamp', 'picture', 'shower',
             'toilet', 'tv_monitor', 'sink', 'bathtub', 'counter', 'fireplace', 'gym_equipment'
         ]
 
@@ -448,6 +448,19 @@ class SG_Nav_Agent():
         # Inject CAD objects from DynamicQA manifest (if configured)
         self._injected_objects.clear()
         self._inject_from_manifest()
+
+        # Override navigation goal to the injected object's category
+        if self._inject_manifest and self._injected_objects:
+            rec_idx = self._inject_record_idx if self._inject_record_idx is not None else 0
+            if rec_idx < len(self._inject_manifest):
+                injected_cad = self._inject_manifest[rec_idx].get('object_category', '')
+                if injected_cad:
+                    self.obj_goal = injected_cad
+                    self.obj_goal_sg = injected_cad
+                    if injected_cad not in self.target_objects_list:
+                        self.target_objects_list = [injected_cad] + self.target_objects_list
+                        self.target_object_idx = 0
+                    print(f"[Inject] Navigation goal overridden to '{injected_cad}'")
         
     def reset_local_scenegraph(self):
         """Reset only the local scene graph after finding a goal object"""
@@ -2065,7 +2078,7 @@ def main():
         help="Enable teleporting to saved frontiers when stuck with no new frontiers"
     )
     parser.add_argument(
-        "--reserve_gpu_gb", default=15, type=float,
+        "--reserve_gpu_gb", default=12, type=float,
         help="Pre-reserve GPU memory in GB to prevent other processes from claiming it"
     )
     # DynamicQA object injection arguments
