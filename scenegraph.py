@@ -2,6 +2,7 @@ import base64
 import math
 import os
 import re
+import time
 from collections import Counter
 from io import BytesIO
 from pathlib import Path, PosixPath
@@ -621,10 +622,10 @@ Object pair(s):
             )
             mask, xyxy, conf = mask.squeeze(1).cpu().numpy(), boxes_filt.squeeze(1).numpy(), conf.squeeze(1).cpu().numpy()
 
-            # IMPORTANT: Clear SAM predictor cache to free GPU memory
-            print("Clearing SAM predictor cache to free GPU memory...")
+            # Release SAM's cached image tensors (they're large).
+            # Do NOT call torch.cuda.empty_cache() here — it's expensive
+            # (~20-50ms) and the allocator can reuse the memory on its own.
             sam_predictor.reset_image()
-            torch.cuda.empty_cache()
         
             return mask, xyxy, conf, caption
         else:
@@ -1050,12 +1051,24 @@ Object pair(s):
 
     def update_scenegraph(self):
         print(f'Navigate Step: {self.navigate_steps}', end='\r')
+        _t0 = time.perf_counter()
         self.segment2d()
+        _seg_ms = (time.perf_counter() - _t0) * 1000
         if len(self.segment2d_results) > 0:
+            _t = time.perf_counter()
             self.mapping3d()
+            _map3d_ms = (time.perf_counter() - _t) * 1000
+            _t = time.perf_counter()
             self.get_caption()
+            _caption_ms = (time.perf_counter() - _t) * 1000
+            _t = time.perf_counter()
             self.update_node()
+            _node_ms = (time.perf_counter() - _t) * 1000
+            _t = time.perf_counter()
             self.update_edge()
+            _edge_ms = (time.perf_counter() - _t) * 1000
+            _total = (time.perf_counter() - _t0) * 1000
+            print(f"[SG Timing] seg2d={_seg_ms:.0f}ms map3d={_map3d_ms:.0f}ms caption={_caption_ms:.0f}ms node={_node_ms:.0f}ms edge={_edge_ms:.0f}ms total={_total:.0f}ms")
 
         # Periodic dedup pass every merge_interval steps (default 20)
         merge_interval = getattr(self.cfg, 'merge_interval', 20)
@@ -1071,8 +1084,12 @@ Object pair(s):
     
         # Strip heavy data from old segment2d entries
         self._compact_old_segment2d_results()
-        # Clear GPU cache after scenegraph update
-        torch.cuda.empty_cache()
+        # Only flush GPU cache periodically (every 10 steps) rather than every step.
+        # torch.cuda.empty_cache() forces the CUDA allocator to return memory to the OS
+        # which is expensive (~20-50ms) and usually unnecessary since PyTorch reuses
+        # freed blocks on its own.
+        if self.navigate_steps % 10 == 0:
+            torch.cuda.empty_cache()
 
     def get_llm_response(self, prompt):
         response = ollama.chat(
@@ -1226,7 +1243,10 @@ Object pair(s):
     def perception(self):
         if not self.agent.found_goal:
             self.agent.detect_objects(self.observations)
-            if self.agent.total_steps % 2 == 0:
+            # Run room detection every 2 steps, but only if the agent has moved
+            # (room layout doesn't change when stationary — saves one GLIP call)
+            agent_moved = self.agent.not_move_steps == 0
+            if self.agent.total_steps % 2 == 0 and (agent_moved or self.agent.total_steps <= 22):
                 room_detection_result = self.agent.glip_demo.inference(self.observations["rgb"][:,:,[2,1,0]], self.agent.rooms_captions)
                 self.agent.update_room_map(self.observations, room_detection_result)
 

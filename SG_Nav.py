@@ -3,6 +3,7 @@ import copy
 import json
 import math
 import os
+import time
 from collections import deque
 from datetime import datetime
 from matplotlib import colors
@@ -979,12 +980,15 @@ class SG_Nav_Agent():
                 self.prob_array_room = np.ones(self.co_occur_room_mtx.shape[1]) / self.co_occur_room_mtx.shape[1]
                 self.prob_array_obj = np.ones(self.num_cooccur_objects) / float(self.num_cooccur_objects)
 
+        _step_t0 = time.perf_counter()
+
         print(f"[Act] Processing observations - depth clipping...")
         observations["depth"][observations["depth"]==0.5] = 100 # don't construct unprecise map with distance less than 0.5 m
         self.depth = observations["depth"]
         self.rgb = observations["rgb"][:,:,[2,1,0]]
         self.rgb_visualization = observations["rgb"]
 
+        _t = time.perf_counter()
         print(f"[Act] Updating LOCAL scene graph...")
         self.scenegraph.set_agent(self)
         self.scenegraph.set_navigate_steps(self.navigate_steps)
@@ -996,10 +1000,12 @@ class SG_Nav_Agent():
         self.scenegraph.set_full_pose(self.full_pose)
         self.scenegraph.update_scenegraph()
         local_node_captions = [n.caption for n in self.scenegraph.nodes]
-        print(f"[Act] LOCAL scene graph updated - Nodes: {len(self.scenegraph.nodes)}, Edges: {len(self.scenegraph.get_edges())}")
+        _local_sg_ms = (time.perf_counter() - _t) * 1000
+        print(f"[Act] LOCAL scene graph updated - Nodes: {len(self.scenegraph.nodes)}, Edges: {len(self.scenegraph.get_edges())} [{_local_sg_ms:.0f}ms]")
         print(f"[Act] LOCAL nodes: {local_node_captions}")
         
         # Update GLOBAL scene graph (persistent)
+        _t = time.perf_counter()
         print(f"[Act] Updating GLOBAL scene graph...")
         self.global_scenegraph.set_agent(self)
         self.global_scenegraph.set_navigate_steps(self.navigate_steps)
@@ -1011,10 +1017,12 @@ class SG_Nav_Agent():
         self.global_scenegraph.set_full_pose(self.full_pose)
         self.global_scenegraph.update_scenegraph()
         global_node_captions = [n.caption for n in self.global_scenegraph.nodes]
-        print(f"[Act] GLOBAL scene graph updated - Nodes: {len(self.global_scenegraph.nodes)}, Edges: {len(self.global_scenegraph.get_edges())}")
+        _global_sg_ms = (time.perf_counter() - _t) * 1000
+        print(f"[Act] GLOBAL scene graph updated - Nodes: {len(self.global_scenegraph.nodes)}, Edges: {len(self.global_scenegraph.get_edges())} [{_global_sg_ms:.0f}ms]")
         print(f"[Act] GLOBAL nodes: {global_node_captions}")
 
         # Need Global ones too, done
+        _t = time.perf_counter()
         print(f"[Act] Updating local maps...")
         self.update_map(observations)
         self.update_free_map(observations)
@@ -1022,8 +1030,8 @@ class SG_Nav_Agent():
         print(f"[Act] Updating global maps...")
         self.update_global_free_map(observations)
         self.update_global_map(observations)
-        
-        print(f"[Act] Maps updated successfully")
+        _maps_ms = (time.perf_counter() - _t) * 1000
+        print(f"[Act] Maps updated successfully [{_maps_ms:.0f}ms]")
 
         if self.total_steps == 1:
             print(f"[Act] Step 1: Setting view angle to 30 degrees (initial lookup)")
@@ -1069,8 +1077,12 @@ class SG_Nav_Agent():
             self.panoramic.append(observations["rgb"][:,:,[2,1,0]])
             self.panoramic_depth.append(observations["depth"])
             # This gets triggered regularly
+            _t = time.perf_counter()
             print(f"[Act] Detecting objects in current view...")
             self.detect_objects(observations)
+            _detect_ms = (time.perf_counter() - _t) * 1000
+            print(f"[Act] Object detection done [{_detect_ms:.0f}ms]")
+            _t = time.perf_counter()
             print(f"[Act] Detecting room layout...")
             room_detection_result = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], rooms_captions)
             self.update_room_map(observations, room_detection_result)
@@ -1079,6 +1091,8 @@ class SG_Nav_Agent():
             # adding global scene graph room information
             print(f"[Act] Updating GLOBAL room map")
             self.update_global_room_map(observations, room_detection_result)
+            _room_ms = (time.perf_counter() - _t) * 1000
+            print(f"[Act] Room detection + map update done [{_room_ms:.0f}ms]")
 
             if not self.found_goal: # if found a goal, directly go to it
                 print(f"[Act] Goal not found yet, continuing panoramic rotation")
@@ -1101,8 +1115,11 @@ class SG_Nav_Agent():
         self.last_gps = observations["gps"]
         
         # only doing once is fine since they refer to same agent
+        _t = time.perf_counter()
         print(f"[Act] Running scene graph perception...")
         self.scenegraph.perception()
+        _percep_ms = (time.perf_counter() - _t) * 1000
+        print(f"[Act] Perception done [{_percep_ms:.0f}ms]")
           
         self.history_pose.append(self.full_pose.cpu().detach().clone())
         print(f"[Act] Recorded agent pose - History length: {len(self.history_pose)}")
@@ -1335,11 +1352,11 @@ class SG_Nav_Agent():
         
         # Print final metrics and statistics
         self.print_metrics()
+        _step_total_ms = (time.perf_counter() - _step_t0) * 1000
         print(f"[Act] Final action: {number_action} | Fronts: {self.fronter_this_ex} | Random: {self.random_this_ex} | Move steps: {self.move_steps}")
         print(f"[Act] Objects found: {sum(self.found_objects.values())}/{len(self.target_objects_list)}")
+        print(f"[Timing] Step {self.total_steps}: LOCAL_SG={_local_sg_ms:.0f}ms | GLOBAL_SG={_global_sg_ms:.0f}ms | Maps={_maps_ms:.0f}ms | Total={_step_total_ms:.0f}ms")
         print(f"{'='*100}\n")
-        
-        torch.cuda.empty_cache()
         
         return {"action": number_action}
     
@@ -2050,6 +2067,7 @@ def _reserve_gpu_memory(reserve_gb=15):
         reserve_bytes = min(reserve_bytes, int(free_before * 0.95))  # don't exceed 95% of free
         print(f"[GPU Reserve] Reserving {reserve_bytes / 1024**3:.2f} GB of GPU memory "
               f"(free: {free_before / 1024**3:.2f} GB, total: {total / 1024**3:.2f} GB)")
+        # intentially leave the tensor allocated for the duration of the program to hold the memory
         dummy = torch.empty(reserve_bytes // 4, dtype=torch.float32, device='cuda:0')
         del dummy
         free_after, _ = _get_free_and_total_gpu_memory()
