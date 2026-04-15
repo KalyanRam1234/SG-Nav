@@ -1016,6 +1016,18 @@ class MatchWeights:
                 max_match_dist=5.0)
         elif mode == "dynamic":
             # Position: ~16%, Neighborhood+Relations: ~24%, Identity: ~60%
+            # --- old defaults (MAS 68.3%) ---
+            # return MatchWeights(
+            #     w_spatial=0.08, w_color=0.14, w_nch=0.08,
+            #     w_clip_visual=0.11, w_neighbor_clip=0.06,
+            #     w_snapshot=0.08, w_label=0.05, w_shape=0.03,
+            #     w_clip_text=0.03, w_room=0.06,
+            #     w_rel_hist=0.08,
+            #     w_fpfh=0.06, w_height=0.04, w_bbox_extent=0.04,
+            #     w_dominant_color=0.03, w_clip_stability=0.03,
+            #     unmatched_cost=0.38,
+            #     max_match_dist=8.0)
+            # --- tuned defaults (MAS 78.3%, gate 1.5m) ---
             return MatchWeights(
                 w_spatial=0.08, w_color=0.14, w_nch=0.08,
                 w_clip_visual=0.11, w_neighbor_clip=0.06,
@@ -1025,7 +1037,7 @@ class MatchWeights:
                 w_fpfh=0.06, w_height=0.04, w_bbox_extent=0.04,
                 w_dominant_color=0.03, w_clip_stability=0.03,
                 unmatched_cost=0.38,
-                max_match_dist=8.0)
+                max_match_dist=1.5)
         else:
             raise ValueError(f"Unknown mode: {mode!r}. Use 'static' or 'dynamic'.")
 
@@ -1770,9 +1782,14 @@ def compute_match_accuracy(
 @dataclass
 class ChangeThresholds:
     """Thresholds for classifying matched pairs."""
-    same_clip_min: float = 0.75
-    same_dist_max: float = 2.0
-    moved_clip_min: float = 0.70
+    # --- old defaults (MAS 68.3%) ---
+    # same_clip_min: float = 0.75
+    # same_dist_max: float = 2.0
+    # moved_clip_min: float = 0.70
+    # --- tuned defaults (MAS 78.3%) ---
+    same_clip_min: float = 0.88
+    same_dist_max: float = 1.0
+    moved_clip_min: float = 0.72
     replaced_clip_max: float = 0.50
     replaced_dist_max: float = 1.5
     cost_reject: float = 0.42
@@ -2209,9 +2226,9 @@ def main():
                         help='Neighborhood consensus refinement iterations (0=off, 2-3 recommended)')
 
     # Change detection thresholds
-    parser.add_argument('--same-clip-min', type=float, default=0.75)
-    parser.add_argument('--same-dist-max', type=float, default=2.0)
-    parser.add_argument('--moved-clip-min', type=float, default=0.70)
+    parser.add_argument('--same-clip-min', type=float, default=0.88)
+    parser.add_argument('--same-dist-max', type=float, default=1.0)
+    parser.add_argument('--moved-clip-min', type=float, default=0.72)
 
     args = parser.parse_args()
 
@@ -2249,18 +2266,23 @@ def main():
 
     # Mode-aware threshold defaults
     if args.mode == 'dynamic':
-        default_same_dist = 3.0     # tighter than before (spatial gating handles outliers)
-        default_same_clip = 0.80    # rely more on identity
-        default_moved_clip = 0.65   # accept looser identity for MOVED
+        # --- old defaults (MAS 68.3%) ---
+        # default_same_dist = 3.0
+        # default_same_clip = 0.80
+        # default_moved_clip = 0.65
+        # --- tuned defaults (MAS 78.3%) ---
+        default_same_dist = 1.0
+        default_same_clip = 0.88
+        default_moved_clip = 0.72
     else:
         default_same_dist = 2.0
         default_same_clip = 0.75
         default_moved_clip = 0.70
 
     thresholds = ChangeThresholds(
-        same_clip_min=args.same_clip_min if args.same_clip_min != 0.75 else default_same_clip,
-        same_dist_max=args.same_dist_max if args.same_dist_max != 2.0 else default_same_dist,
-        moved_clip_min=args.moved_clip_min if args.moved_clip_min != 0.70 else default_moved_clip,
+        same_clip_min=args.same_clip_min if args.same_clip_min != 0.88 else default_same_clip,
+        same_dist_max=args.same_dist_max if args.same_dist_max != 1.0 else default_same_dist,
+        moved_clip_min=args.moved_clip_min if args.moved_clip_min != 0.72 else default_moved_clip,
         cost_reject=weights.unmatched_cost,
     )
 

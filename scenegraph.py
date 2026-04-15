@@ -238,7 +238,7 @@ class Edge():
 
 
 class SceneGraph():
-    def __init__(self, map_resolution, map_size_cm, map_size, camera_matrix, is_navigation=True, agent=None, is_global=False) -> None:
+    def __init__(self, map_resolution, map_size_cm, map_size, camera_matrix, is_navigation=True, agent=None, is_global=False, shared_models=None) -> None:
         self.map_resolution = map_resolution
         self.map_size_cm = map_size_cm
         self.map_size = map_size
@@ -322,18 +322,45 @@ Object pair(s):
         self.prompt_graph_corr_1 = 'What else do you need to know to determine the probability of A and B appearing together? [A:{}], [B:{}]. Please output a short question (output only one sentence with no additional text).'
         self.prompt_graph_corr_2 = 'Here is the objects and relationships near A: [{}] You answer the following question with a short sentence based on this information. Question: {}'
         self.prompt_graph_corr_3 = 'The probability of A and B appearing together is about {}. Based on the dialog: [{}], re-determine the probability of A and B appearing together. A:[{}], B:[{}]. Even if you do not have enough information, you have to answer with a value from 0 to 1 anyway. Answer only the value of probability and do not answer any other text.'
-        self.mask_generator = self.get_sam_mask_generator(self.sam_variant, self.device)
-        
-        # Load CLIP model for text and visual embeddings (DovSG-style)
-        clip_model_name = "openai/clip-vit-base-patch32"
-        print(f"[SceneGraph] Loading CLIP model: {clip_model_name}")
-        self.clip_model = CLIPModel.from_pretrained(clip_model_name).to(self.device)
-        self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
-        self.clip_model.eval()
-        print(f"[SceneGraph] CLIP model loaded successfully")
+
+        # --- GPU model loading (or reuse from shared_models) ---
+        # GroundingDINO + SAM and CLIP are heavy (~5-8 GB combined).
+        # When two SceneGraph instances exist (local + global), the second
+        # one can reuse the first's models via shared_models dict to halve
+        # GPU memory and eliminate redundant weight loading.
+        if shared_models is not None:
+            print(f"[SceneGraph] Reusing shared models (GroundingDINO+SAM, CLIP) — no extra GPU memory")
+            self.mask_generator = shared_models['mask_generator']
+            self.clip_model = shared_models['clip_model']
+            self.clip_processor = shared_models['clip_processor']
+        else:
+            self.mask_generator = self.get_sam_mask_generator(self.sam_variant, self.device)
+            clip_model_name = "openai/clip-vit-base-patch32"
+            print(f"[SceneGraph] Loading CLIP model: {clip_model_name}")
+            self.clip_model = CLIPModel.from_pretrained(clip_model_name).to(self.device)
+            self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+            self.clip_model.eval()
+            print(f"[SceneGraph] CLIP model loaded successfully")
         
         self.set_cfg()
         self.set_agent(agent)
+        # Pre-warm Ollama model so first edge call isn't a cold start (~10s load)
+        self._warm_ollama()
+
+    def _warm_ollama(self):
+        """Pre-load the Ollama model into GPU memory and pin it with keep_alive=-1."""
+        try:
+            import time
+            t0 = time.perf_counter()
+            ollama.chat(
+                model=self.vlm_name,
+                messages=[{'role': 'user', 'content': 'hi'}],
+                keep_alive=-1,
+            )
+            elapsed = time.perf_counter() - t0
+            print(f"[SceneGraph] Ollama model '{self.vlm_name}' pre-warmed in {elapsed:.1f}s (pinned with keep_alive=-1)")
+        except Exception as e:
+            print(f"[SceneGraph] WARNING: Ollama warm-up failed: {e}")
 
     def _load_object_vocabulary(self, filepath):
         """Load object vocabulary from file for GroundingDINO prompt"""
@@ -383,8 +410,8 @@ Object pair(s):
                 feats = self.clip_model.get_text_features(**inputs)
             feats = feats / feats.norm(dim=-1, keepdim=True)
             for label, feat in zip(missing, feats):
-                self._clip_text_cache[label] = feat
-        return torch.stack([self._clip_text_cache[label] for label in labels], dim=0)
+                self._clip_text_cache[label] = feat.cpu()
+        return torch.stack([self._clip_text_cache[label] for label in labels], dim=0).to(self.device)
 
     def _select_caption_for_detection(self, raw_caption, image_feat):
         candidates = self._extract_caption_candidates(raw_caption)
@@ -634,55 +661,55 @@ Object pair(s):
     def compute_clip_features(self, image, detections, classes):
         """Compute CLIP image and text features for each detection.
         Uses HuggingFace CLIPModel + CLIPProcessor.
+        Batched: all image crops processed in one GPU forward pass,
+        text features cached per unique class label.
         Returns: image_crops, image_feats (N, D), text_feats (N, D) as numpy arrays.
         """
         image = Image.fromarray(image)
         padding = 20
+        image_width, image_height = image.size
         
+        # --- Collect all crops ---
         image_crops = []
-        image_feats = []
-        text_feats = []
-        
         for idx in range(len(detections.xyxy)):
             x_min, y_min, x_max, y_max = detections.xyxy[idx]
-
-            image_width, image_height = image.size
             left_padding = min(padding, x_min)
             top_padding = min(padding, y_min)
             right_padding = min(padding, image_width - x_max)
             bottom_padding = min(padding, image_height - y_max)
-
             x_min -= left_padding
             y_min -= top_padding
             x_max += right_padding
             y_max += bottom_padding
-
-            cropped_image = image.crop((x_min, y_min, x_max, y_max))
-            
-            # Compute CLIP image embedding
-            image_inputs = self.clip_processor(images=cropped_image, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                crop_feat = self.clip_model.get_image_features(**image_inputs)
-            crop_feat = crop_feat / crop_feat.norm(dim=-1, keepdim=True)
-            
-            # Compute CLIP text embedding from class label
-            class_id = detections.class_id[idx]
-            text_inputs = self.clip_processor(text=[classes[class_id]], return_tensors="pt", padding=True).to(self.device)
-            with torch.no_grad():
-                text_feat = self.clip_model.get_text_features(**text_inputs)
-            text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
-            
-            crop_feat = crop_feat.cpu().numpy()
-            text_feat = text_feat.cpu().numpy()
-
-            image_crops.append(cropped_image)
-            image_feats.append(crop_feat)
-            text_feats.append(text_feat)
-
-            del image_inputs, text_inputs
-            
-        image_feats = np.concatenate(image_feats, axis=0)
-        text_feats = np.concatenate(text_feats, axis=0)
+            image_crops.append(image.crop((x_min, y_min, x_max, y_max)))
+        
+        if len(image_crops) == 0:
+            return image_crops, np.empty((0, 512)), np.empty((0, 512))
+        
+        # --- Batched image features (single GPU forward pass) ---
+        image_inputs = self.clip_processor(images=image_crops, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            image_feats = self.clip_model.get_image_features(**image_inputs)
+        image_feats = image_feats / image_feats.norm(dim=-1, keepdim=True)
+        image_feats = image_feats.cpu().numpy()
+        del image_inputs
+        
+        # --- Cached text features (one forward pass per unique label) ---
+        if not hasattr(self, '_clip_text_cache'):
+            self._clip_text_cache = {}
+        
+        unique_cids = set(detections.class_id)
+        for cid in unique_cids:
+            label = classes[cid]
+            if label not in self._clip_text_cache:
+                text_inputs = self.clip_processor(text=[label], return_tensors="pt", padding=True).to(self.device)
+                with torch.no_grad():
+                    tf = self.clip_model.get_text_features(**text_inputs)
+                tf = tf / tf.norm(dim=-1, keepdim=True)
+                self._clip_text_cache[label] = tf.squeeze(0).cpu()
+                del text_inputs
+        
+        text_feats = np.array([self._clip_text_cache[classes[cid]].numpy() for cid in detections.class_id])
 
         return image_crops, image_feats, text_feats
 
@@ -758,21 +785,31 @@ Object pair(s):
                 print(f"[Segment2D] No detections (caption=None), skipping frame")
                 return
             print(f"[Segment2D] Detected {len(mask)} segments: {caption}")
+            # Build per-detection class_id from GroundingDINO captions.
+            # Previously all detections got class_id=0 → class_name='item';
+            # now each gets its real label so dedup can gate on category.
+            # Normalize captions: lowercase, strip punctuation, map to vocabulary when possible.
+            norm_captions = []
+            for c in caption:
+                candidates = self._extract_caption_candidates(c)
+                norm_captions.append(candidates[0] if candidates else self._normalize_caption_text(c))
+            unique_classes = sorted(set(norm_captions))
+            class_id_arr = np.array([unique_classes.index(c) for c in norm_captions], dtype=int)
             detections = sv.Detections(
                 xyxy=xyxy,
                 confidence=conf,
-                class_id=np.zeros_like(conf).astype(int),
+                class_id=class_id_arr,
                 mask=mask,
             )
             with torch.no_grad():
-                image_crops, image_feats, text_feats = self.compute_clip_features(self.image_rgb, detections, self.classes)
+                image_crops, image_feats, text_feats = self.compute_clip_features(self.image_rgb, detections, unique_classes)
             image_appear_efficiency = [''] * len(image_crops)
             self.segment2d_results.append({
                 "xyxy": detections.xyxy,
                 "confidence": detections.confidence,
                 "class_id": detections.class_id,
                 "mask": detections.mask,
-                "classes": self.classes,
+                "classes": unique_classes,
                 "image_feats": image_feats,
                 "text_feats": text_feats,
                 "image_appear_efficiency": image_appear_efficiency,
@@ -796,7 +833,7 @@ Object pair(s):
             idx = idx,
             gobs = gobs,
             trans_pose = self.pose_matrix,
-            class_names = self.classes,
+            class_names = gobs['classes'],
             BG_CLASSES = self.BG_CLASSES,
             is_navigation = self.is_navigation,
             navigate_step = getattr(self, 'navigate_steps', None),
@@ -1097,7 +1134,8 @@ Object pair(s):
             messages=[{
                 'role': 'user',
                 'content': prompt,
-            }]
+            }],
+            keep_alive=-1,
         )
         return response.message.content
     
@@ -1112,7 +1150,8 @@ Object pair(s):
                 'role': 'user',
                 'content': prompt,
                 'images': [image_str]
-            }]
+            }],
+            keep_alive=-1,
         )
         return response.message.content
         

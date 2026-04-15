@@ -161,8 +161,14 @@ class SG_Nav_Agent():
         
         self.scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self)
 
-        # Need Separate global variables
-        self.global_scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self, is_global=True)
+        # Reuse the same GroundingDINO+SAM and CLIP model instances for the
+        # global graph — halves GPU memory (~5-8 GB saved) and startup time.
+        shared = {
+            'mask_generator': self.scenegraph.mask_generator,
+            'clip_model':     self.scenegraph.clip_model,
+            'clip_processor': self.scenegraph.clip_processor,
+        }
+        self.global_scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self, is_global=True, shared_models=shared)
 
         self.target_objects_list = [
             'cup', 'chair', 'table', 'sofa', 'cabinet', 'plant', 'lamp', 'picture', 'shower',
@@ -201,6 +207,11 @@ class SG_Nav_Agent():
 
         if self.split:
             self.experiment_name = self.experiment_name + f'/[{self.args.split_l}:{self.args.split_r}]'
+
+        # Create a timestamped run folder so each run's outputs are isolated
+        from datetime import datetime
+        self.run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.experiment_name = os.path.join(self.experiment_name, f'run_{self.run_timestamp}')
 
         self.visualization_dir = f'data/visualization/{self.experiment_name}/'
 
@@ -2096,7 +2107,7 @@ def main():
         help="Enable teleporting to saved frontiers when stuck with no new frontiers"
     )
     parser.add_argument(
-        "--reserve_gpu_gb", default=12, type=float,
+        "--reserve_gpu_gb", default=15, type=float,
         help="Pre-reserve GPU memory in GB to prevent other processes from claiming it"
     )
     # DynamicQA object injection arguments

@@ -126,7 +126,11 @@ def dedup_detections(cfg, detection_list: DetectionList,
         pts = np.asarray(det['pcd'].points)
         centroids.append(pts.mean(axis=0) if len(pts) > 0 else np.zeros(3))
         clip_feats.append(to_tensor(det['clip_ft']))
-        class_names.append(det.get('class_name', '').lower().strip())
+        cn = det.get('class_name', '')
+        if isinstance(cn, list):
+            print(f"[Dedup] Warning: detection has multiple class names {cn}, using the first one for deduplication")
+            cn = cn[0] if cn else ''
+        class_names.append(cn.lower().strip())
 
     centroids = np.stack(centroids)  # (N, 3)
     clip_feats = torch.stack(clip_feats)  # (N, D)
@@ -193,6 +197,7 @@ def periodic_merge_objects(cfg, objects: MapObjectList,
 
     Returns a new (smaller or equal) MapObjectList.
     """
+    print(f"[PeriodicMerge] Running periodic merge on {len(objects)} objects...")
     n = len(objects)
     if n <= 1:
         return objects
@@ -205,7 +210,11 @@ def periodic_merge_objects(cfg, objects: MapObjectList,
         pts = np.asarray(obj['pcd'].points)
         centroids.append(pts.mean(axis=0) if len(pts) > 0 else np.zeros(3))
         clip_feats.append(to_tensor(obj['clip_ft']))
-        captions.append(obj.get('class_name', '').lower().strip())
+        cn = obj.get('class_name', '')
+        if isinstance(cn, list):
+            print(f"[Dedup] Warning: detection has multiple class names {cn}, using the first one for deduplication")
+            cn = cn[0] if cn else ''
+        captions.append(cn.lower().strip())
 
     centroids = np.stack(centroids)
     clip_feats = torch.stack(clip_feats)
