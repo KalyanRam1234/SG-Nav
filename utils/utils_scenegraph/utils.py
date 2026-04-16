@@ -10,10 +10,36 @@ from .slam_classes import MapObjectList, DetectionList, to_tensor
 from .iou import compute_3d_iou_accuracte_batch, compute_iou_batch, mask_subtract_contained
 
 
-def filter_objects(cfg, objects: MapObjectList):
+def filter_objects(cfg, objects: MapObjectList, small_object_classes=None):
+    """Filter objects that don't meet minimum quality criteria.
+    
+    Args:
+        small_object_classes: set of class names that are small objects.
+            These get a relaxed bbox_extent threshold (0.05m instead of 0.4m).
+    """
+    if small_object_classes is None:
+        small_object_classes = set()
     objects_to_keep = []
     for obj in objects:
-        if len(obj['pcd'].points) >= cfg.obj_min_points and obj['num_detections'] >= cfg.obj_min_detections and (np.array(obj['pcd'].points).max(axis=0) - np.array(obj['pcd'].points).min(axis=0)).max() > 0.4:
+        n_pts = len(obj['pcd'].points)
+        n_det = obj['num_detections']
+        bbox_extent = (np.array(obj['pcd'].points).max(axis=0) - np.array(obj['pcd'].points).min(axis=0)).max() if n_pts > 0 else 0
+        cn = obj.get('class_name', '?')
+        if isinstance(cn, list):
+            cn = cn[0] if cn else '?'
+        # Small objects (cups, phones, etc.) need a much smaller extent threshold
+        extent_thresh = 0.05 if cn in small_object_classes else 0.4
+        keep = n_pts >= cfg.obj_min_points and n_det >= cfg.obj_min_detections and bbox_extent > extent_thresh
+        if not keep:
+            reasons = []
+            if n_pts < cfg.obj_min_points:
+                reasons.append(f"pts={n_pts}<{cfg.obj_min_points}")
+            if n_det < cfg.obj_min_detections:
+                reasons.append(f"det={n_det}<{cfg.obj_min_detections}")
+            if bbox_extent <= extent_thresh:
+                reasons.append(f"bbox={bbox_extent:.2f}<={extent_thresh}")
+            print(f"[FilterObjects] DROPPED '{cn}': {', '.join(reasons)}")
+        if keep:
             objects_to_keep.append(obj)
     objects = MapObjectList(objects_to_keep)
     
@@ -25,7 +51,16 @@ def filter_gobs(
     gobs: dict,
     image: np.ndarray,
     BG_CLASSES = ["wall", "floor", "ceiling"],
+    small_object_classes = None,
 ):
+    """Filter raw detections based on quality criteria.
+    
+    Args:
+        small_object_classes: set of class names for small objects.
+            These use a relaxed mask_conf_threshold (0.5 instead of cfg value).
+    """
+    if small_object_classes is None:
+        small_object_classes = set()
     # If no detection at all
     if len(gobs['xyxy']) == 0:
         return gobs
@@ -50,11 +85,11 @@ def filter_gobs(
             bbox_area = (x2 - x1) * (y2 - y1)
             image_area = image.shape[0] * image.shape[1]
             if bbox_area > cfg.max_bbox_area_ratio * image_area:
-                # print(f"Skipping {class_name} with area {bbox_area} > {cfg.max_bbox_area_ratio} * {image_area}")
                 continue
             
-        # Skip masks with low confidence
-        if gobs['confidence'][mask_idx] < cfg.mask_conf_threshold:
+        # Skip masks with low confidence — relaxed for small objects
+        conf_thresh = 0.5 if class_name in small_object_classes else cfg.mask_conf_threshold
+        if gobs['confidence'][mask_idx] < conf_thresh:
             continue
         
         idx_to_keep.append(mask_idx)
@@ -211,16 +246,19 @@ def gobs_to_detection_list(
     color_path = None,
     is_navigation = False,
     navigate_step = None,
+    small_object_classes = None,
 ):
     '''
     Return a DetectionList object from the gobs
     All object are still in the camera frame. 
     '''
+    if small_object_classes is None:
+        small_object_classes = set()
     fg_detection_list = DetectionList()
     bg_detection_list = DetectionList()
     
     gobs = resize_gobs(gobs, image)
-    gobs = filter_gobs(cfg, gobs, image, BG_CLASSES)
+    gobs = filter_gobs(cfg, gobs, image, BG_CLASSES, small_object_classes=small_object_classes)
     
     if len(gobs['xyxy']) == 0:
         return fg_detection_list, bg_detection_list
@@ -247,8 +285,9 @@ def gobs_to_detection_list(
             is_navigation = is_navigation,
         )
         
-        # It at least contains 5 points
-        if len(camera_object_pcd.points) < max(cfg.min_points_threshold, 5): 
+        # Relaxed min_points for small objects (5 vs cfg threshold)
+        min_pts = 5 if class_name in small_object_classes else max(cfg.min_points_threshold, 5)
+        if len(camera_object_pcd.points) < min_pts: 
             continue
         
         if trans_pose is not None:
@@ -548,6 +587,7 @@ def merge_obj2_into_obj1(cfg, obj1, obj2, run_dbscan=True):
     SPECIAL_FIELDS = {
         'pcd', 'bbox', 'clip_ft', 'text_ft',
         'score', 'captions', 'reason', 'id', 'node',
+        'class_name',
         'first_seen_step', 'last_seen_step', 'height_range',
         'fpfh_descriptor', 'dominant_colors', 'bbox_rotation', 'bbox_extent',
         'observation_confidence', 'clip_ft_variance', 'clip_ft_mean_sq',

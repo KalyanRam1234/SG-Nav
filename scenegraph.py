@@ -4,9 +4,11 @@ import os
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path, PosixPath
 import cv2
+import httpx
 import numpy as np
 import omegaconf
 import supervision as sv
@@ -276,11 +278,23 @@ class SceneGraph():
         self.segment2d_results = []
         self.max_detections_per_object = 10
         
-        self.threshold_list = {'bathtub': 1, 'bed': 3, 'cabinet': 2, 'chair': 2, 'chest_of_drawers': 2, 'clothes': 4, 'counter': 2, 'cushion': 3, 'fireplace': 2, 'gym_equipment': 3, 'picture': 4, 'plant': 2, 'seating': 1, 'shower': 1, 'sink': 2, 'sofa': 4, 'stool': 2, 'table': 3, 'toilet': 2, 'towel': 2, 'tv_monitor': 1, 'treadmill': 2, 'fitness equipment': 2,
-            'lamp': 2, 'mirror': 2, 'rug': 2, 'curtain': 2, 'shelf': 2, 'desk': 2, 'door': 2, 'window': 2, 'pillow': 2, 'blanket': 2,
-            # DynamicQA small/dynamic objects — low thresholds since they're small
+        self.threshold_list = {
+            # Large objects — need more detections to confirm (reduce false positives)
+            'bathtub': 2, 'bed': 3, 'sofa': 3, 'table': 3, 'counter': 2,
+            'fireplace': 2, 'gym_equipment': 3, 'treadmill': 2, 'fitness equipment': 2,
+            'shower': 2, 'cabinet': 2, 'chest_of_drawers': 2,
+            # Medium objects
+            'chair': 2, 'stool': 2, 'sink': 2, 'toilet': 2, 'desk': 2,
+            'shelf': 2, 'door': 2, 'window': 2, 'curtain': 2, 'rug': 2,
+            'lamp': 2, 'mirror': 2, 'plant': 2, 'towel': 2,
+            'pillow': 2, 'blanket': 2, 'cushion': 2,
+            # Frequently misdetected — need more confirmations
+            'picture': 4, 'clothes': 4, 'seating': 2,
+            'tv_monitor': 1,
+            # Small/dynamic objects — accept on first detection
             'phone': 1, 'cell phone': 1, 'remote': 1, 'tv remote': 1, 'laptop': 1,
-            'book': 1, 'keys': 1, 'mug': 1, 'cup': 1, 'bottle': 1, 'plate': 1, 'bowl': 1}
+            'book': 1, 'keys': 1, 'mug': 1, 'cup': 1, 'bottle': 1, 'plate': 1, 'bowl': 1,
+        }
         self.small_objects = ['bathtub', 'chest_of_drawers', 'cushion', 'plant', 'seating', 'shower', 'toilet', 'tv_monitor',
             'lamp', 'mirror', 'pillow', 'blanket',
             # DynamicQA small/dynamic objects
@@ -344,15 +358,18 @@ Object pair(s):
         
         self.set_cfg()
         self.set_agent(agent)
+        # Create Ollama client with explicit timeouts to prevent indefinite hangs.
+        # 120s read covers LLM batch calls (10 edge pairs); 5s connect catches server issues.
+        self._ollama_client = ollama.Client(
+            timeout=httpx.Timeout(120.0, connect=5.0))
         # Pre-warm Ollama model so first edge call isn't a cold start (~10s load)
         self._warm_ollama()
 
     def _warm_ollama(self):
         """Pre-load the Ollama model into GPU memory and pin it with keep_alive=-1."""
         try:
-            import time
             t0 = time.perf_counter()
-            ollama.chat(
+            self._ollama_client.chat(
                 model=self.vlm_name,
                 messages=[{'role': 'user', 'content': 'hi'}],
                 keep_alive=-1,
@@ -461,8 +478,7 @@ Object pair(s):
     def set_obj_goal(self, obj_goal, obj_goal_sg):
         self.obj_goal = obj_goal
         self.obj_goal_sg = obj_goal_sg
-        # Global SG uses a fixed threshold to avoid node spikes on goal switches
-        if not self.is_global and self.obj_goal in self.threshold_list:
+        if self.obj_goal in self.threshold_list:
             self.cfg.obj_min_detections = self.threshold_list[self.obj_goal]
 
     def set_navigate_steps(self, navigate_steps):
@@ -776,6 +792,61 @@ Object pair(s):
         ])
         return pose_matrix
 
+    def _run_target_recovery_pass(self, image, groundingdino, sam_predictor):
+        """Run a focused GroundingDINO+SAM pass for goal object(s) only.
+        
+        Uses lower thresholds than the dense pass to catch small/hard-to-detect
+        target objects that were missed in the full-vocabulary detection.
+        Returns (mask, xyxy, conf, caption) or (None, None, None, None).
+        """
+        obj_goal_sg = getattr(self, 'obj_goal_sg', '')
+        if not obj_goal_sg:
+            return None, None, None, None
+
+        # obj_goal_sg is a string like 'cup' or 'treadmill. fitness equipment.'
+        # Use it directly as the GroundingDINO prompt (ensure it ends with '.')
+        goal_prompt = obj_goal_sg.strip()
+        if not goal_prompt.endswith('.'):
+            goal_prompt += '.'
+        print(f"[Segment2D] Recovery pass for goal: '{goal_prompt}'")
+
+        transform = T.Compose([
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        image_resized, _ = transform(Image.fromarray(image), None)
+
+        boxes_filt, caption = get_grounding_output(
+            groundingdino, image_resized, caption=goal_prompt,
+            box_threshold=0.15, text_threshold=0.15,
+            with_logits=False, device=self.device)
+
+        if len(caption) == 0:
+            print(f"[Segment2D] Recovery pass: no detections")
+            return None, None, None, None
+
+        sam_predictor.set_image(image)
+        H, W = image.shape[0], image.shape[1]
+        for i in range(boxes_filt.size(0)):
+            boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+            boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+            boxes_filt[i][2:] += boxes_filt[i][:2]
+        boxes_filt = boxes_filt.cpu()
+        transformed_boxes = sam_predictor.transform.apply_boxes_torch(
+            boxes_filt, image.shape[:2]).to(self.device)
+        mask, conf, _ = sam_predictor.predict_torch(
+            point_coords=None, point_labels=None,
+            boxes=transformed_boxes.to(self.device),
+            multimask_output=False)
+        mask = mask.squeeze(1).cpu().numpy()
+        xyxy = boxes_filt.squeeze(1).numpy()
+        conf = conf.squeeze(1).cpu().numpy()
+        sam_predictor.reset_image()
+
+        print(f"[Segment2D] Recovery pass found {len(caption)} detections: {caption}")
+        return mask, xyxy, conf, caption
+
     def segment2d(self):
         if self.sam_variant == 'sam' or self.sam_variant == 'groundedsam':
             mask, xyxy, conf, caption = self.get_sam_segmentation_dense(self.sam_variant, self.mask_generator, self.image_rgb)
@@ -783,11 +854,106 @@ Object pair(s):
             self.seg_caption = caption
             if caption is None:
                 print(f"[Segment2D] No detections (caption=None), skipping frame")
-                return
+                # Even with no dense detections, try recovery pass for goal
+                if self.sam_variant == 'groundedsam':
+                    mask, xyxy, conf, caption = self._run_target_recovery_pass(
+                        self.image_rgb, self.mask_generator[0], self.mask_generator[1])
+                    if caption is None:
+                        return
+                    self.seg_xyxy = xyxy
+                    self.seg_caption = caption
+                else:
+                    return
+
             print(f"[Segment2D] Detected {len(mask)} segments: {caption}")
+
+            # Recovery pass: if goal object not found in dense detections,
+            # run a focused GroundingDINO pass with lower thresholds.
+            obj_goal_sg = getattr(self, 'obj_goal_sg', '')
+            if obj_goal_sg and self.sam_variant == 'groundedsam':
+                # Parse goal labels from obj_goal_sg string (e.g. 'cup' or 'treadmill. fitness equipment.')
+                goal_tokens = {t.strip().lower() for t in obj_goal_sg.replace('.', ' ').split() if t.strip()}
+                norm_dense = set()
+                for c in caption:
+                    cands = self._extract_caption_candidates(c)
+                    norm_dense.add(cands[0] if cands else self._normalize_caption_text(c))
+                # Check if any goal token appears in any dense caption
+                goal_found = any(
+                    any(gt in nc for gt in goal_tokens)
+                    for nc in norm_dense
+                )
+                if not goal_found:
+                    r_mask, r_xyxy, r_conf, r_caption = self._run_target_recovery_pass(
+                        self.image_rgb, self.mask_generator[0], self.mask_generator[1])
+                    if r_caption is not None and len(r_caption) > 0:
+                        # NMS among recovery detections: keep highest-conf box,
+                        # suppress overlapping boxes (IoU > 0.5) of same class.
+                        if len(r_caption) > 1:
+                            order = np.argsort(-r_conf)
+                            nms_keep = []
+                            suppressed = set()
+                            for oi in range(len(order)):
+                                idx_i = order[oi]
+                                if idx_i in suppressed:
+                                    continue
+                                nms_keep.append(idx_i)
+                                bx1, by1, bx2, by2 = r_xyxy[idx_i]
+                                b_area = max((bx2 - bx1) * (by2 - by1), 1e-6)
+                                for oj in range(oi + 1, len(order)):
+                                    idx_j = order[oj]
+                                    if idx_j in suppressed:
+                                        continue
+                                    cx1, cy1, cx2, cy2 = r_xyxy[idx_j]
+                                    c_area = max((cx2 - cx1) * (cy2 - cy1), 1e-6)
+                                    ix1 = max(bx1, cx1); iy1 = max(by1, cy1)
+                                    ix2 = min(bx2, cx2); iy2 = min(by2, cy2)
+                                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                                    iou = inter / max(b_area + c_area - inter, 1e-6)
+                                    if iou > 0.3:
+                                        suppressed.add(idx_j)
+                            nms_keep = sorted(nms_keep)
+                            if len(nms_keep) < len(r_caption):
+                                print(f"[Segment2D] Recovery NMS: {len(r_caption)} -> {len(nms_keep)} detections")
+                            r_mask = r_mask[nms_keep]
+                            r_xyxy = r_xyxy[nms_keep]
+                            r_conf = r_conf[nms_keep]
+                            r_caption = [r_caption[i] for i in nms_keep]
+                        # Deduplicate: skip recovery boxes that have high IoU with
+                        # dense boxes OF THE SAME CLASS. Use standard IoU (inter/union)
+                        # not containment ratio, to avoid killing small objects inside
+                        # large unrelated detections (e.g. cup inside rug bbox).
+                        goal_tokens_lower = {t.strip().lower() for t in obj_goal_sg.replace('.', ' ').split() if t.strip()}
+                        kept = []
+                        for ri in range(len(r_caption)):
+                            overlap = False
+                            rx1, ry1, rx2, ry2 = r_xyxy[ri]
+                            r_area = max((rx2 - rx1) * (ry2 - ry1), 1e-6)
+                            for di in range(len(xyxy)):
+                                # Only compare against dense detections of the same class
+                                dense_cap = caption[di].lower().strip() if di < len(caption) else ''
+                                if not any(gt in dense_cap for gt in goal_tokens_lower):
+                                    continue
+                                dx1, dy1, dx2, dy2 = xyxy[di]
+                                ix1 = max(rx1, dx1); iy1 = max(ry1, dy1)
+                                ix2 = min(rx2, dx2); iy2 = min(ry2, dy2)
+                                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                                d_area = max((dx2 - dx1) * (dy2 - dy1), 1e-6)
+                                union = r_area + d_area - inter
+                                iou = inter / max(union, 1e-6)
+                                if iou > 0.5:
+                                    overlap = True
+                                    break
+                            if not overlap:
+                                kept.append(ri)
+                        if kept:
+                            mask = np.concatenate([mask, r_mask[kept]], axis=0)
+                            xyxy = np.concatenate([xyxy, r_xyxy[kept]], axis=0)
+                            conf = np.concatenate([conf, r_conf[kept]], axis=0)
+                            caption = list(caption) + [r_caption[i] for i in kept]
+                            print(f"[Segment2D] Recovery pass added {len(kept)} goal detections: "
+                                  f"{[r_caption[i] for i in kept]}")
+
             # Build per-detection class_id from GroundingDINO captions.
-            # Previously all detections got class_id=0 → class_name='item';
-            # now each gets its real label so dedup can gate on category.
             # Normalize captions: lowercase, strip punctuation, map to vocabulary when possible.
             norm_captions = []
             for c in caption:
@@ -837,7 +1003,7 @@ Object pair(s):
             BG_CLASSES = self.BG_CLASSES,
             is_navigation = self.is_navigation,
             navigate_step = getattr(self, 'navigate_steps', None),
-            # color_path = color_path,
+            small_object_classes = set(self.small_objects),
         )
         
         if len(fg_detection_list) == 0:
@@ -855,7 +1021,15 @@ Object pair(s):
             print(f"[Mapping3D] First frame: added {len(fg_detection_list)} objects (no prior objects to match)")
 
             # Skip the similarity computation 
-            self.objects_post = filter_objects(self.cfg, self.objects)
+            print(f"[Mapping3D] is_global={self.is_global} obj_min_detections={self.cfg.obj_min_detections} "
+                  f"num_objects_before_filter={len(self.objects)}")
+            for obj in self.objects:
+                cn = obj.get('class_name', '?')
+                nd = obj.get('num_detections', '?')
+                np_ = len(obj['pcd'].points) if 'pcd' in obj else 0
+                print(f"  obj '{cn}' num_det={nd} n_pts={np_}")
+            self.objects_post = filter_objects(self.cfg, self.objects, small_object_classes=set(self.small_objects))
+            print(f"[Mapping3D] After filter: {len(self.objects_post)} objects in objects_post")
             return
                 
         spatial_sim = compute_spatial_similarities(self.cfg, fg_detection_list, self.objects)
@@ -886,7 +1060,7 @@ Object pair(s):
         agg_sim[agg_sim < self.cfg.sim_threshold] = float('-inf')
         
         self.objects = merge_detections_to_objects(self.cfg, fg_detection_list, self.objects, agg_sim)
-        self.objects_post = filter_objects(self.cfg, self.objects)
+        self.objects_post = filter_objects(self.cfg, self.objects, small_object_classes=set(self.small_objects))
 
         # Clean up intermediate tensors
         del spatial_sim, visual_sim, agg_sim, fg_detection_list, bg_detection_list
@@ -906,6 +1080,26 @@ Object pair(s):
                     caption_list.append(caption)
                 caption = self.find_modes(caption_list)[0]
                 object['captions'] = [caption]
+
+    def _prune_stale_nodes(self):
+        """Remove nodes whose objects were merged away during periodic merge.
+        
+        Uses back-references (obj['node']) to identify valid nodes rather than
+        object identity, which is not stable across save/load cycles.
+        """
+        valid_nodes = {obj.get('node') for obj in self.objects_post if obj.get('node') is not None}
+        stale_nodes = [n for n in self.nodes if n not in valid_nodes]
+        if not stale_nodes:
+            return
+        for node in stale_nodes:
+            for edge in list(node.edges):
+                edge.delete()
+            if node.room_node is not None:
+                node.room_node.nodes.discard(node)
+            self.nodes.remove(node)
+        removed_captions = [n.caption for n in stale_nodes]
+        print(f"[PeriodicMerge] Pruned {len(stale_nodes)} stale nodes: {removed_captions}")
+        print(f"[PeriodicMerge] Remaining nodes: {len(self.nodes)}")
 
     def update_node(self):
         # update nodes
@@ -962,63 +1156,82 @@ Object pair(s):
                 old_nodes.append(node)
         if len(new_nodes) == 0:
             return
-        # create the edge between new_node and old_node
+        # Create edges between new nodes and old nodes
         new_edges = []
-        for i, new_node in enumerate(new_nodes):
-            for j, old_node in enumerate(old_nodes):
-                new_edge = Edge(new_node, old_node)
-                new_edges.append(new_edge)
-        # create the edge between new_node
-        for i, new_node1 in enumerate(new_nodes):
-            for j, new_node2 in enumerate(new_nodes[i + 1:]):
-                new_edge = Edge(new_node1, new_node2)
-                new_edges.append(new_edge)
-        # get all new_edges
-        new_edges = set()
-        for i, node in enumerate(self.nodes):
-            node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
-            new_edges = new_edges | node_new_edges
-        new_edges = list(new_edges)
-        for new_edge in new_edges:
-            image, frame_idx, bboxes = self.get_joint_image(
-                new_edge.node1, new_edge.node2, return_metadata=True)
+        for new_node in new_nodes:
+            for old_node in old_nodes:
+                new_edges.append(Edge(new_node, old_node))
+        # Create edges between pairs of new nodes
+        for i, n1 in enumerate(new_nodes):
+            for n2 in new_nodes[i + 1:]:
+                new_edges.append(Edge(n1, n2))
+
+        # --- Phase 1: Parallel VLM calls for edges with a joint image ---
+        # Prepare work items on the main thread (reads only)
+        work_items = []
+        for edge in new_edges:
+            result = self.get_joint_image(edge.node1, edge.node2, return_metadata=True)
+            image, frame_idx, bboxes = result
             if image is not None:
-                prompt = self.prompt_relation.format(new_edge.node1.caption, new_edge.node2.caption)
-                response = self.get_vlm_response(prompt=prompt, image=image)
-                response = response.replace('.', '').lower()
-                new_edge.set_relation(response)
-                new_edge.compute_spatial_metrics()
-                # Capture memory snapshot
-                if self.store_edge_snapshots:
-                    step = getattr(self, 'navigate_steps', None)
-                    clip_feat = self._compute_snapshot_clip(image)
-                    new_edge.set_snapshot(
-                        image, frame_idx=frame_idx, step=step,
-                        bboxes=bboxes, clip_features=clip_feat)
-        new_edges = set()
-        for i, node in enumerate(self.nodes):
-            node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
-            new_edges = new_edges | node_new_edges
-        new_edges = list(new_edges)
-        # get all relation proposals
-        if len(new_edges) > 0:
-            node_pairs = []
-            for new_edge in new_edges:
-                node_pairs.append(new_edge.node1.caption)
-                node_pairs.append(new_edge.node2.caption)
-            prompt = self.prompt_edge_proposal + '\n({}, {})' * len(new_edges)
-            prompt = prompt.format(*node_pairs)
-            relations = self.get_llm_response(prompt=prompt)
-            relations = relations.split('\n')
-            if len(relations) == len(new_edges):
-                for i, relation in enumerate(relations):
-                    new_edges[i].set_relation(relation)
-                    new_edges[i].compute_spatial_metrics()
-            # discriminate all relation proposals
+                prompt = self.prompt_relation.format(edge.node1.caption, edge.node2.caption)
+                work_items.append((edge, image, frame_idx, bboxes, prompt))
+
+        if work_items:
+            # Execute VLM calls in parallel (IO-bound HTTP; 4 workers benchmarked optimal)
+            def _vlm_call(prompt, image):
+                return self.get_vlm_response(prompt=prompt, image=image)
+
+            vlm_results = [None] * len(work_items)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {
+                    pool.submit(_vlm_call, item[4], item[1]): idx
+                    for idx, item in enumerate(work_items)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        vlm_results[idx] = future.result()
+                    except Exception as e:
+                        print(f"[Edge] VLM call failed for edge {idx}: {e}")
+
+            # Apply results on main thread (graph mutation + GPU CLIP)
+            for idx, (edge, image, frame_idx, bboxes, _prompt) in enumerate(work_items):
+                response = vlm_results[idx]
+                if response:
+                    response = response.replace('.', '').lower()
+                    edge.set_relation(response)
+                    edge.compute_spatial_metrics()
+                    if self.store_edge_snapshots:
+                        step = getattr(self, 'navigate_steps', None)
+                        clip_feat = self._compute_snapshot_clip(image)
+                        edge.set_snapshot(
+                            image, frame_idx=frame_idx, step=step,
+                            bboxes=bboxes, clip_features=clip_feat)
+
+        # --- Phase 2: LLM batch proposal for remaining unresolved edges ---
+        remaining = [e for e in new_edges if e.relation is None]
+        if len(remaining) > 0:
+            # Process in chunks of 10 to keep prompt size manageable
+            CHUNK = 10
+            for chunk_start in range(0, len(remaining), CHUNK):
+                chunk = remaining[chunk_start:chunk_start + CHUNK]
+                node_pairs = []
+                for edge in chunk:
+                    node_pairs.append(edge.node1.caption)
+                    node_pairs.append(edge.node2.caption)
+                prompt = self.prompt_edge_proposal + '\n({}, {})' * len(chunk)
+                prompt = prompt.format(*node_pairs)
+                relations = self.get_llm_response(prompt=prompt)
+                relations = relations.split('\n')
+                if len(relations) == len(chunk):
+                    for i, relation in enumerate(relations):
+                        chunk[i].set_relation(relation)
+                        chunk[i].compute_spatial_metrics()
+            # Discriminate all LLM-proposed relations
             self.free_map = self.fbe_free_map.cpu().numpy()[0,0,::-1].copy() > 0.5
-            for i, new_edge in enumerate(new_edges):
-                if new_edge.relation == None or not self.discriminate_relation(new_edge):
-                    new_edge.delete()
+            for edge in remaining:
+                if edge.relation is None or not self.discriminate_relation(edge):
+                    edge.delete()
 
     def update_group(self):
         for room_node in self.room_nodes:
@@ -1117,7 +1330,8 @@ Object pair(s):
                 self.cfg, self.objects,
                 centroid_thresh=0.5, visual_thresh=0.6)
             if len(self.objects) < prev_count:
-                self.objects_post = filter_objects(self.cfg, self.objects)
+                self.objects_post = filter_objects(self.cfg, self.objects, small_object_classes=set(self.small_objects))
+                self._prune_stale_nodes()
     
         # Strip heavy data from old segment2d entries
         self._compact_old_segment2d_results()
@@ -1129,31 +1343,43 @@ Object pair(s):
             torch.cuda.empty_cache()
 
     def get_llm_response(self, prompt):
-        response = ollama.chat(
-            model=self.llm_name,
-            messages=[{
-                'role': 'user',
-                'content': prompt,
-            }],
-            keep_alive=-1,
-        )
-        return response.message.content
+        for attempt in range(3):
+            try:
+                response = self._ollama_client.chat(
+                    model=self.llm_name,
+                    messages=[{
+                        'role': 'user',
+                        'content': prompt,
+                    }],
+                    keep_alive=-1,
+                )
+                return response.message.content
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                print(f"[Ollama] LLM attempt {attempt+1}/3 failed: {e}")
+                if attempt == 2:
+                    return ""
     
     def get_vlm_response(self, prompt, image):
         buffered = BytesIO()
         image.save(buffered, format='PNG')
         image_bytes = base64.b64encode(buffered.getvalue())
         image_str = str(image_bytes, 'utf-8')
-        response = ollama.chat(
-            model=self.vlm_name,
-            messages=[{
-                'role': 'user',
-                'content': prompt,
-                'images': [image_str]
-            }],
-            keep_alive=-1,
-        )
-        return response.message.content
+        for attempt in range(3):
+            try:
+                response = self._ollama_client.chat(
+                    model=self.vlm_name,
+                    messages=[{
+                        'role': 'user',
+                        'content': prompt,
+                        'images': [image_str]
+                    }],
+                    keep_alive=-1,
+                )
+                return response.message.content
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                print(f"[Ollama] VLM attempt {attempt+1}/3 failed: {e}")
+                if attempt == 2:
+                    return ""
         
     def find_modes(self, lst):  
         if len(lst) == 0:

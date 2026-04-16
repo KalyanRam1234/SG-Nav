@@ -1,11 +1,36 @@
 import argparse
 import copy
+import faulthandler
 import json
 import math
 import os
+import signal
+import sys
 import time
+import warnings
 from collections import deque
 from datetime import datetime
+
+# Suppress HuggingFace tokenizer fork warnings and prevent deadlocks
+# when subprocesses are spawned after CLIP/GroundingDINO init.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Flush stdout after every print so that log files show progress in real time
+# (Python uses full buffering when stdout is redirected to a file).
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+# Enable faulthandler so that SIGUSR1 dumps all thread tracebacks to stderr.
+# Usage: kill -USR1 <pid>  → see thread stacks in the log's stderr stream.
+faulthandler.enable()
+faulthandler.register(signal.SIGUSR1)
+
+# Suppress noisy but harmless warnings from transformers/torch that fire
+# on every CLIP forward pass (grid_sample align_corners, device deprecation, etc.)
+warnings.filterwarnings("ignore", message=".*align_corners.*")
+warnings.filterwarnings("ignore", message=".*`device` argument is deprecated.*")
+warnings.filterwarnings("ignore", message=".*requires_grad.*")
+warnings.filterwarnings("ignore", message=".*resume_download.*")
 from matplotlib import colors
 import cv2
 import numpy as np
