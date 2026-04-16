@@ -473,6 +473,10 @@ Object pair(s):
             cfg.sim_threshold_spatial = 0.01
             cfg.w_spatial = 0.5
             cfg.w_visual = 0.5
+            # Visual-only rescue: when spatial < spatial_rescue_threshold,
+            # merge if visual > visual_only_threshold (same class required).
+            cfg.visual_only_threshold = 0.75
+            cfg.spatial_rescue_threshold = 0.05
         self.cfg = cfg
 
     def set_agent(self, agent):
@@ -848,6 +852,18 @@ Object pair(s):
         sam_predictor.reset_image()
 
         print(f"[Segment2D] Recovery pass found {len(caption)} detections: {caption}")
+
+        # Keep only the single highest-confidence detection.
+        # The recovery pass targets one specific goal object, so multiple
+        # detections are almost always duplicates of the same small object.
+        if len(caption) > 1:
+            best_idx = int(np.argmax(conf))
+            mask = mask[[best_idx]]
+            xyxy = xyxy[[best_idx]]
+            conf = conf[[best_idx]]
+            caption = [caption[best_idx]]
+            print(f"[Segment2D] Recovery: kept best detection (conf={conf[0]:.3f})")
+
         return mask, xyxy, conf, caption
 
     def segment2d(self):
@@ -1068,6 +1084,32 @@ Object pair(s):
         # Threshold combined sim. Set to negative infinity if below threshold
         agg_sim[agg_sim < self.cfg.sim_threshold] = float('-inf')
         
+        # Visual-only rescue: when spatial IoU is below a threshold (small/moved
+        # objects where 3D bboxes are unreliable), allow strong same-class visual
+        # matches to merge instead of creating duplicates.
+        visual_only_thresh = getattr(self.cfg, 'visual_only_threshold', 0.75)
+        spatial_rescue_thresh = getattr(self.cfg, 'spatial_rescue_threshold', 0.05)
+        for i in range(agg_sim.shape[0]):
+            if agg_sim[i].max() > float('-inf'):
+                continue  # Already matched via combined score
+            # Check if spatial similarity is low for same-class objects
+            spatial_for_class = spatial_sim[i].clone()
+            spatial_for_class[~class_mask[i]] = -1.0
+            best_spatial_for_class = spatial_for_class.max().item()
+            if best_spatial_for_class > spatial_rescue_thresh:
+                continue  # Spatial signal is strong enough, trust combined score
+            # Spatial is negligible — fall back to visual-only matching
+            visual_candidates = visual_sim[i].clone()
+            visual_candidates[~class_mask[i]] = -1.0
+            best_vj = visual_candidates.argmax().item()
+            best_vs = visual_candidates[best_vj].item()
+            if best_vs >= visual_only_thresh:
+                agg_sim[i, best_vj] = best_vs
+                det_cn = fg_detection_list[i].get('class_name', '?')
+                obj_cn = self.objects[best_vj].get('class_name', '?')
+                print(f"[Mapping3D]   VISUAL-RESCUE '{det_cn}' -> '{obj_cn}' "
+                      f"visual={best_vs:.3f} (best spatial={best_spatial_for_class:.3f} < {spatial_rescue_thresh})")
+
         self.objects = merge_detections_to_objects(self.cfg, fg_detection_list, self.objects, agg_sim)
         self.objects_post = filter_objects(self.cfg, self.objects, small_object_classes=set(self.small_objects))
 
