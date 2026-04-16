@@ -474,9 +474,11 @@ Object pair(s):
             cfg.w_spatial = 0.5
             cfg.w_visual = 0.5
             # Visual-only rescue: when spatial < spatial_rescue_threshold,
-            # merge if visual > visual_only_threshold (same class required).
+            # merge if visual > visual_only_threshold AND centroid distance
+            # < rescue_centroid_threshold (same class required).
             cfg.visual_only_threshold = 0.75
             cfg.spatial_rescue_threshold = 0.05
+            cfg.rescue_centroid_threshold = 0.5
         self.cfg = cfg
 
     def set_agent(self, agent):
@@ -1087,8 +1089,11 @@ Object pair(s):
         # Visual-only rescue: when spatial IoU is below a threshold (small/moved
         # objects where 3D bboxes are unreliable), allow strong same-class visual
         # matches to merge instead of creating duplicates.
+        # Includes centroid distance guard to prevent merging distinct same-class
+        # objects that happen to look similar (e.g. two identical chairs).
         visual_only_thresh = getattr(self.cfg, 'visual_only_threshold', 0.75)
         spatial_rescue_thresh = getattr(self.cfg, 'spatial_rescue_threshold', 0.05)
+        rescue_centroid_thresh = getattr(self.cfg, 'rescue_centroid_threshold', 0.5)
         for i in range(agg_sim.shape[0]):
             if agg_sim[i].max() > float('-inf'):
                 continue  # Already matched via combined score
@@ -1099,16 +1104,37 @@ Object pair(s):
             if best_spatial_for_class > spatial_rescue_thresh:
                 continue  # Spatial signal is strong enough, trust combined score
             # Spatial is negligible — fall back to visual-only matching
-            visual_candidates = visual_sim[i].clone()
-            visual_candidates[~class_mask[i]] = -1.0
-            best_vj = visual_candidates.argmax().item()
-            best_vs = visual_candidates[best_vj].item()
-            if best_vs >= visual_only_thresh:
+            # with centroid distance guard
+            det_pts = np.asarray(fg_detection_list[i]['pcd'].points)
+            det_centroid = det_pts.mean(axis=0) if len(det_pts) > 0 else None
+            if det_centroid is None:
+                continue
+            best_vj = -1
+            best_vs = -1.0
+            for j in range(len(self.objects)):
+                if not class_mask[i, j]:
+                    continue
+                vs = visual_sim[i, j].item()
+                if vs < visual_only_thresh:
+                    continue
+                obj_pts = np.asarray(self.objects[j]['pcd'].points)
+                obj_centroid = obj_pts.mean(axis=0) if len(obj_pts) > 0 else None
+                if obj_centroid is None:
+                    continue
+                dist = np.linalg.norm(det_centroid - obj_centroid)
+                if dist > rescue_centroid_thresh:
+                    continue
+                if vs > best_vs:
+                    best_vs = vs
+                    best_vj = j
+            if best_vj >= 0:
                 agg_sim[i, best_vj] = best_vs
                 det_cn = fg_detection_list[i].get('class_name', '?')
                 obj_cn = self.objects[best_vj].get('class_name', '?')
+                obj_pts = np.asarray(self.objects[best_vj]['pcd'].points)
+                dist = np.linalg.norm(det_centroid - obj_pts.mean(axis=0))
                 print(f"[Mapping3D]   VISUAL-RESCUE '{det_cn}' -> '{obj_cn}' "
-                      f"visual={best_vs:.3f} (best spatial={best_spatial_for_class:.3f} < {spatial_rescue_thresh})")
+                      f"visual={best_vs:.3f} dist={dist:.3f}m (spatial={best_spatial_for_class:.3f})")
 
         self.objects = merge_detections_to_objects(self.cfg, fg_detection_list, self.objects, agg_sim)
         self.objects_post = filter_objects(self.cfg, self.objects, small_object_classes=set(self.small_objects))
