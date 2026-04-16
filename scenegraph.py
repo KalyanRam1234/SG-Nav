@@ -22,7 +22,7 @@ from segment_anything import SamAutomaticMaskGenerator, SamPredictor, sam_model_
 from GroundingDINO.groundingdino.datasets import transforms as T
 from transformers import CLIPModel, CLIPProcessor
 
-from utils.utils_scenegraph.mapping import compute_spatial_similarities, compute_visual_similarities, aggregate_similarities, merge_detections_to_objects, dedup_detections, periodic_merge_objects
+from utils.utils_scenegraph.mapping import compute_spatial_similarities, compute_visual_similarities, aggregate_similarities, merge_detections_to_objects, dedup_detections, periodic_merge_objects, compute_class_mask
 from utils.utils_scenegraph.slam_classes import MapObjectList
 from utils.utils_scenegraph.utils import filter_objects, gobs_to_detection_list, text2value
 from utils.utils_scenegraph.grounded_sam_demo import get_grounding_output, load_image, load_model
@@ -464,12 +464,15 @@ Object pair(s):
         ObjectNode.reset_id_counter()
 
     def set_cfg(self):
-        cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': 'cuda', 'use_iou': True, 'spatial_sim_type': 'iou_accurate', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.01, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 5, 'obj_min_points': 0, 'obj_min_detections': 2, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
+        cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': 'cuda', 'use_iou': True, 'spatial_sim_type': 'iou_accurate', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.01, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 5, 'obj_min_points': 0, 'obj_min_detections': 2, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': False, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
         cfg = DictConfig(cfg)
         if self.is_navigation:
-            # Threshold for aggregate similarity (weighted avg of spatial + visual, range [0,1])
-            cfg.sim_threshold = 0.6
+            # Visual-primary matching: balanced weights for dynamic-scene readiness.
+            # Spatial disambiguates same-class objects; visual drives identity.
+            cfg.sim_threshold = 0.45
             cfg.sim_threshold_spatial = 0.01
+            cfg.w_spatial = 0.5
+            cfg.w_visual = 0.5
         self.cfg = cfg
 
     def set_agent(self, agent):
@@ -1034,26 +1037,32 @@ Object pair(s):
                 
         spatial_sim = compute_spatial_similarities(self.cfg, fg_detection_list, self.objects)
         visual_sim = compute_visual_similarities(self.cfg, fg_detection_list, self.objects)
-        agg_sim = aggregate_similarities(self.cfg, spatial_sim, visual_sim)
+        class_mask = compute_class_mask(fg_detection_list, self.objects)
+        agg_sim = aggregate_similarities(self.cfg, spatial_sim, visual_sim, class_mask=class_mask)
 
         # Log per-detection similarity scores before thresholding
         num_new = 0
         num_merged = 0
         for i in range(agg_sim.shape[0]):
-            best_j = agg_sim[i].argmax().item()
-            best_spatial = spatial_sim[i, best_j].item()
-            best_visual = visual_sim[i, best_j].item()
-            best_agg = agg_sim[i, best_j].item()
             det_caption = fg_detection_list[i].get('class_name', '?')
-            obj_caption = self.objects[best_j].get('class_name', '?') if best_j < len(self.objects) else '?'
-            if best_agg < self.cfg.sim_threshold:
+            # Find best same-class match (agg_sim already has -inf for cross-class)
+            best_agg = agg_sim[i].max().item()
+            if best_agg == float('-inf'):
                 num_new += 1
-                print(f"[Mapping3D]   NEW object '{det_caption}' | best match '{obj_caption}' "
-                      f"spatial={best_spatial:.3f} visual={best_visual:.3f} agg={best_agg:.3f} < threshold={self.cfg.sim_threshold}")
+                print(f"[Mapping3D]   NEW object '{det_caption}' | no same-class match in map")
             else:
-                num_merged += 1
-                print(f"[Mapping3D]   MERGED '{det_caption}' -> '{obj_caption}' "
-                      f"spatial={best_spatial:.3f} visual={best_visual:.3f} agg={best_agg:.3f} >= threshold={self.cfg.sim_threshold}")
+                best_j = agg_sim[i].argmax().item()
+                best_spatial = spatial_sim[i, best_j].item()
+                best_visual = visual_sim[i, best_j].item()
+                obj_caption = self.objects[best_j].get('class_name', '?')
+                if best_agg < self.cfg.sim_threshold:
+                    num_new += 1
+                    print(f"[Mapping3D]   NEW object '{det_caption}' | best match '{obj_caption}' "
+                          f"spatial={best_spatial:.3f} visual={best_visual:.3f} agg={best_agg:.3f} < threshold={self.cfg.sim_threshold}")
+                else:
+                    num_merged += 1
+                    print(f"[Mapping3D]   MERGED '{det_caption}' -> '{obj_caption}' "
+                          f"spatial={best_spatial:.3f} visual={best_visual:.3f} agg={best_agg:.3f} >= threshold={self.cfg.sim_threshold}")
         print(f"[Mapping3D] {len(fg_detection_list)} detections: {num_new} new, {num_merged} merged into existing (total objects: {len(self.objects)})")
         
         # Threshold combined sim. Set to negative infinity if below threshold

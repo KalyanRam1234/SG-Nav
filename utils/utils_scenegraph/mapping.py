@@ -5,6 +5,50 @@ from .slam_classes import MapObjectList, DetectionList, to_tensor
 from .utils import compute_overlap_matrix_2set, merge_obj2_into_obj1
 from .iou import compute_iou_batch, compute_3d_iou_accuracte_batch
 
+# Synonym groups: objects that should be treated as same class for matching.
+# Each tuple is a group of equivalent labels.
+CLASS_SYNONYMS = [
+    ('cup', 'mug'),
+    ('phone', 'cell phone'),
+    ('remote', 'tv remote'),
+    ('cushion', 'cushion pillow'),
+    ('treadmill', 'fitness equipment'),
+]
+# Build lookup: label -> canonical form (first element in group)
+_SYNONYM_MAP = {}
+for group in CLASS_SYNONYMS:
+    canonical = group[0]
+    for label in group:
+        _SYNONYM_MAP[label] = canonical
+
+
+def _normalize_class_name(obj_or_det) -> str:
+    """Extract and normalize class name from a detection or object dict."""
+    cn = obj_or_det.get('class_name', '')
+    if isinstance(cn, list):
+        cn = cn[0] if cn else ''
+    cn = cn.lower().strip()
+    return _SYNONYM_MAP.get(cn, cn)
+
+
+def compute_class_mask(detection_list, objects) -> torch.Tensor:
+    """Build M×N boolean mask: True where detection i and object j share the same class.
+
+    Uses synonym-aware normalization so 'cup' matches 'mug', etc.
+    """
+    M = len(detection_list)
+    N = len(objects)
+    mask = torch.zeros(M, N, dtype=torch.bool)
+
+    det_classes = [_normalize_class_name(d) for d in detection_list]
+    obj_classes = [_normalize_class_name(o) for o in objects]
+
+    for i, dc in enumerate(det_classes):
+        for j, oc in enumerate(obj_classes):
+            if dc == oc:
+                mask[i, j] = True
+    return mask
+
 
 
 def compute_spatial_similarities(cfg, detection_list: DetectionList, objects: MapObjectList) -> torch.Tensor:
@@ -61,22 +105,32 @@ def compute_visual_similarities(cfg, detection_list: DetectionList, objects: Map
     return visual_sim
 
 
-def aggregate_similarities(cfg, spatial_sim: torch.Tensor, visual_sim: torch.Tensor) -> torch.Tensor:
+def aggregate_similarities(cfg, spatial_sim: torch.Tensor, visual_sim: torch.Tensor,
+                           class_mask: torch.Tensor = None) -> torch.Tensor:
     '''
     Combine spatial and visual similarities into an aggregate score.
-    DovSG-style: weighted sum of spatial overlap and CLIP visual similarity.
-    Spatial is weighted higher to prevent merging visually-similar but
-    physically-distinct objects (e.g. two chairs across a room).
+
+    Visual-primary design for dynamic-scene readiness: object identity is
+    determined by appearance (CLIP), with spatial overlap as disambiguation
+    when multiple visually-similar objects of the same class exist.
+
+    Same-class gating (via class_mask) prevents cross-class merges entirely.
 
     Args:
         spatial_sim: MxN spatial similarity matrix
         visual_sim: MxN visual similarity matrix
+        class_mask: optional MxN bool tensor; True where classes match.
+                    Cross-class pairs are set to -inf.
     Returns:
         MxN aggregated similarity matrix
     '''
-    w_spatial = 0.7
-    w_visual = 0.3
+    w_spatial = getattr(cfg, 'w_spatial', 0.5)
+    w_visual = getattr(cfg, 'w_visual', 0.5)
     agg_sim = w_spatial * spatial_sim + w_visual * visual_sim
+
+    if class_mask is not None:
+        agg_sim[~class_mask] = float('-inf')
+
     return agg_sim
 
 
@@ -126,11 +180,7 @@ def dedup_detections(cfg, detection_list: DetectionList,
         pts = np.asarray(det['pcd'].points)
         centroids.append(pts.mean(axis=0) if len(pts) > 0 else np.zeros(3))
         clip_feats.append(to_tensor(det['clip_ft']))
-        cn = det.get('class_name', '')
-        if isinstance(cn, list):
-            print(f"[Dedup] Warning: detection has multiple class names {cn}, using the first one for deduplication")
-            cn = cn[0] if cn else ''
-        class_names.append(cn.lower().strip())
+        class_names.append(_normalize_class_name(det))
 
     centroids = np.stack(centroids)  # (N, 3)
     clip_feats = torch.stack(clip_feats)  # (N, D)
@@ -190,10 +240,10 @@ def periodic_merge_objects(cfg, objects: MapObjectList,
                            visual_thresh: float = 0.6) -> MapObjectList:
     """Post-hoc deduplication pass over the full object list.
 
-    Finds pairs of existing objects that share the same caption AND have
-    centroids within centroid_thresh metres AND CLIP cosine >= visual_thresh,
-    then merges them.  Runs in O(N^2) which is fine for typical scene sizes
-    (< 500 objects).
+    Finds pairs of existing objects that share the same class (synonym-aware)
+    AND have centroids within centroid_thresh metres AND CLIP cosine >=
+    visual_thresh, then merges them.  Runs in O(N^2) which is fine for
+    typical scene sizes (< 500 objects).
 
     Returns a new (smaller or equal) MapObjectList.
     """
@@ -210,11 +260,7 @@ def periodic_merge_objects(cfg, objects: MapObjectList,
         pts = np.asarray(obj['pcd'].points)
         centroids.append(pts.mean(axis=0) if len(pts) > 0 else np.zeros(3))
         clip_feats.append(to_tensor(obj['clip_ft']))
-        cn = obj.get('class_name', '')
-        if isinstance(cn, list):
-            print(f"[Dedup] Warning: detection has multiple class names {cn}, using the first one for deduplication")
-            cn = cn[0] if cn else ''
-        captions.append(cn.lower().strip())
+        captions.append(_normalize_class_name(obj))
 
     centroids = np.stack(centroids)
     clip_feats = torch.stack(clip_feats)
