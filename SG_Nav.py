@@ -1132,6 +1132,20 @@ class SG_Nav_Agent():
 
             if not self.found_goal: # if found a goal, directly go to it
                 print(f"[Act] Goal not found yet, continuing panoramic rotation")
+                # Save a visualization frame for panoramic steps
+                if self.args.visualize:
+                    vis = np.full((450, 800, 3), 255, dtype=np.uint8)
+                    vis = add_resized_image(vis, observations["rgb"], (10, 60), (320, 240))
+                    vis = add_rectangle(vis, (10, 60), (330, 300), (128, 128, 128), thickness=1)
+                    vis = add_text(vis, f"Panoramic Step {self.total_steps}/22 (Goal: {self.obj_goal})", (70, 50), font_scale=0.5, thickness=1)
+                    # Show detected objects if available
+                    node_names = [n.name for n in self.scenegraph.node_list] if hasattr(self.scenegraph, 'node_list') else []
+                    if node_names:
+                        vis = add_text(vis, "Scene Graph Nodes", (580, 50), font_scale=0.5, thickness=1)
+                        vis = add_rectangle(vis, (540, 60), (790, 165), (128, 128, 128), thickness=1)
+                        vis = add_text_list(vis, line_list(', '.join(node_names), 40), (550, 80), font_scale=0.3, thickness=1)
+                    vis = vis[:, :, ::-1]
+                    self.visualize_image_list.append(vis)
                 self.print_metrics()
                 return {"action": 6}
                     
