@@ -222,6 +222,7 @@ class SG_Nav_Agent():
         self._inject_variant = getattr(args, 'inject_variant', 0)
         self._inject_record_idx = getattr(args, 'inject_record_idx', None)
         self._injected_objects = []  # track injected rigid objects
+        self._injection_done = False  # only inject on the first reset()
         if hasattr(args, 'inject_manifest') and args.inject_manifest:
             self._inject_manifest = self._load_inject_manifest(args.inject_manifest)
             print(f"[Inject] Loaded manifest with {len(self._inject_manifest)} records "
@@ -482,9 +483,12 @@ class SG_Nav_Agent():
 
         self.scenegraph.reset()
 
-        # Inject CAD objects from DynamicQA manifest (if configured)
-        self._injected_objects.clear()
-        self._inject_from_manifest()
+        # Inject CAD objects from DynamicQA manifest (only on the first episode reset)
+        if not self._injection_done:
+            self._injected_objects.clear()
+            self._inject_from_manifest()
+            if self._injected_objects:
+                self._injection_done = True
 
         # Override navigation goal to the injected object's category
         if self._inject_manifest and self._injected_objects:
@@ -1069,6 +1073,20 @@ class SG_Nav_Agent():
         _maps_ms = (time.perf_counter() - _t) * 1000
         print(f"[Act] Maps updated successfully [{_maps_ms:.0f}ms]")
 
+        # Save a visualization frame during panoramic steps (before early returns)
+        if self.total_steps <= 22 and self.args.visualize and not self.found_goal:
+            vis = np.full((450, 800, 3), 255, dtype=np.uint8)
+            vis = add_resized_image(vis, observations["rgb"], (10, 60), (320, 240))
+            vis = add_rectangle(vis, (10, 60), (330, 300), (128, 128, 128), thickness=1)
+            vis = add_text(vis, f"Panoramic Step {self.total_steps}/22 (Goal: {self.obj_goal})", (70, 50), font_scale=0.5, thickness=1)
+            node_names = [n.caption for n in self.scenegraph.nodes] if hasattr(self.scenegraph, 'nodes') else []
+            if node_names:
+                vis = add_text(vis, "Scene Graph Nodes", (580, 50), font_scale=0.5, thickness=1)
+                vis = add_rectangle(vis, (540, 60), (790, 165), (128, 128, 128), thickness=1)
+                vis = add_text_list(vis, line_list(', '.join(node_names), 40), (550, 80), font_scale=0.3, thickness=1)
+            vis = vis[:, :, ::-1]
+            self.visualize_image_list.append(vis)
+
         if self.total_steps == 1:
             print(f"[Act] Step 1: Setting view angle to 30 degrees (initial lookup)")
             self.sem_map_module.set_view_angles(30)
@@ -1132,20 +1150,6 @@ class SG_Nav_Agent():
 
             if not self.found_goal: # if found a goal, directly go to it
                 print(f"[Act] Goal not found yet, continuing panoramic rotation")
-                # Save a visualization frame for panoramic steps
-                if self.args.visualize:
-                    vis = np.full((450, 800, 3), 255, dtype=np.uint8)
-                    vis = add_resized_image(vis, observations["rgb"], (10, 60), (320, 240))
-                    vis = add_rectangle(vis, (10, 60), (330, 300), (128, 128, 128), thickness=1)
-                    vis = add_text(vis, f"Panoramic Step {self.total_steps}/22 (Goal: {self.obj_goal})", (70, 50), font_scale=0.5, thickness=1)
-                    # Show detected objects if available
-                    node_names = [n.name for n in self.scenegraph.node_list] if hasattr(self.scenegraph, 'node_list') else []
-                    if node_names:
-                        vis = add_text(vis, "Scene Graph Nodes", (580, 50), font_scale=0.5, thickness=1)
-                        vis = add_rectangle(vis, (540, 60), (790, 165), (128, 128, 128), thickness=1)
-                        vis = add_text_list(vis, line_list(', '.join(node_names), 40), (550, 80), font_scale=0.3, thickness=1)
-                    vis = vis[:, :, ::-1]
-                    self.visualize_image_list.append(vis)
                 self.print_metrics()
                 return {"action": 6}
                     

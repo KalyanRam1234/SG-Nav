@@ -21,7 +21,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Set
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -1863,7 +1863,8 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
                        weights: MatchWeights = None,
                        thresholds: ChangeThresholds = None,
                        verbose: bool = False,
-                       refine_iters: int = 0) -> MatchReport:
+                       refine_iters: int = 0,
+                       exclude_categories: Optional[Set[str]] = None) -> MatchReport:
     """Full matching pipeline between two saved scene graphs."""
     if weights is None:
         weights = MatchWeights()
@@ -1875,6 +1876,17 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
 
     feats_1 = extract_node_features(sg1_data, label="SG1")
     feats_2 = extract_node_features(sg2_data, label="SG2")
+
+    # Filter out excluded categories (e.g. duplicated objects like 'cup')
+    if exclude_categories:
+        _exc = {c.lower().strip() for c in exclude_categories}
+        pre1, pre2 = len(feats_1), len(feats_2)
+        feats_1 = [f for f in feats_1
+                    if f.caption.lower().strip().replace('_', ' ') not in _exc]
+        feats_2 = [f for f in feats_2
+                    if f.caption.lower().strip().replace('_', ' ') not in _exc]
+        print(f"[{_ts()}] Excluded categories {sorted(_exc)}: "
+              f"SG1 {pre1}->{len(feats_1)}, SG2 {pre2}->{len(feats_2)}")
 
     snaps_1 = build_rich_snapshots(sg1_data, label="SG1")
     snaps_2 = build_rich_snapshots(sg2_data, label="SG2")
@@ -2229,6 +2241,9 @@ def main():
     parser.add_argument('--same-clip-min', type=float, default=0.88)
     parser.add_argument('--same-dist-max', type=float, default=1.0)
     parser.add_argument('--moved-clip-min', type=float, default=0.72)
+    parser.add_argument('--exclude-categories', nargs='+', default=['cup'],
+                        help='Category names to exclude from matching (default: cup). '
+                             'Use --exclude-categories none to disable.')
 
     args = parser.parse_args()
 
@@ -2286,9 +2301,16 @@ def main():
         cost_reject=weights.unmatched_cost,
     )
 
+    # Handle "none" sentinel to disable exclusion
+    exc_cats = args.exclude_categories
+    if exc_cats and len(exc_cats) == 1 and exc_cats[0].lower() == 'none':
+        exc_cats = None
+    exclude_set = set(exc_cats) if exc_cats else None
+
     report = match_scene_graphs(
         args.sg1, args.sg2, weights, thresholds,
-        verbose=args.verbose, refine_iters=args.refine_iters)
+        verbose=args.verbose, refine_iters=args.refine_iters,
+        exclude_categories=exclude_set)
 
     # ---- Print structured summary ----
     n1, n2 = report.sg1_num_nodes, report.sg2_num_nodes

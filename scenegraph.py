@@ -1177,6 +1177,12 @@ Object pair(s):
         removed_captions = [n.caption for n in stale_nodes]
         print(f"[PeriodicMerge] Pruned {len(stale_nodes)} stale nodes: {removed_captions}")
         print(f"[PeriodicMerge] Remaining nodes: {len(self.nodes)}")
+        # Rebuild edge_list from surviving nodes to drop stale edge references
+        surviving_edges = set()
+        for node in self.nodes:
+            surviving_edges.update(node.edges)
+        self.edge_list = list(surviving_edges)
+        print(f"[PeriodicMerge] Remaining edges: {len(self.edge_list)}")
 
     def update_node(self):
         # update nodes
