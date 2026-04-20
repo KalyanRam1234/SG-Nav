@@ -828,7 +828,7 @@ Object pair(s):
 
         boxes_filt, caption = get_grounding_output(
             groundingdino, image_resized, caption=goal_prompt,
-            box_threshold=0.15, text_threshold=0.15,
+            box_threshold=0.22, text_threshold=0.2,
             with_logits=False, device=self.device)
 
         if len(caption) == 0:
@@ -865,6 +865,11 @@ Object pair(s):
             conf = conf[[best_idx]]
             caption = [caption[best_idx]]
             print(f"[Segment2D] Recovery: kept best detection (conf={conf[0]:.3f})")
+
+        # Reject low-confidence detections
+        if conf[0] < 0.3:
+            print(f"[Segment2D] Recovery: rejected (conf={conf[0]:.3f} < 0.30)")
+            return None, None, None, None
 
         return mask, xyxy, conf, caption
 
