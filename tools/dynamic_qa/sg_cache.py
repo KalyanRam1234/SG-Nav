@@ -113,7 +113,8 @@ def node_top_surface_z(node: Dict[str, Any]) -> Optional[float]:
     if aabb is None:
         return None
     _mn, mx = aabb
-    return float(mx[1])  # Habitat-Sim uses Y-up
+    # After _as_np_xyz() swap, data is [X, Y_up, Z] — index 1 = height
+    return float(mx[1])
 
 
 def candidate_support_nodes(

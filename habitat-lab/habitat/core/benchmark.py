@@ -149,6 +149,20 @@ class Benchmark:
         while count_episodes < num_episodes:
             observations = self._env.reset()
             agent.reset()
+            # After injection, re-render so the first observations include the
+            # injected object(s). GPS/compass are unaffected (agent hasn't moved).
+            if getattr(agent, '_injected_objects', None):
+                sim = self._env._sim
+                sim_obs = sim.get_sensor_observations()
+                sim._prev_sim_obs = sim_obs
+                fresh = sim._sensor_suite.get_observations(sim_obs)
+                # Merge re-rendered visual sensors; keep task sensors (gps, compass)
+                observations.update(fresh)
+                print(f"[Benchmark] Re-rendered observations after injecting "
+                      f"{len(agent._injected_objects)} object(s)")
+                # Save a dedicated injection confirmation frame
+                if hasattr(agent, 'save_injection_confirmation'):
+                    agent.save_injection_confirmation(observations)
             metrics = self._env.get_metrics()
             all_metrics_0.append(metrics)
             while not self._env.episode_over:

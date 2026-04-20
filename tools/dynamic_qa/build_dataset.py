@@ -7,12 +7,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from .location_selector import select_support_pair
+from .location_selector import select_support_pair, get_all_support_candidates, SupportChoice
 from .qa_generator import generate_qa_pairs
 from .qa_llm import generate_qa_pairs_llm
 from .llm_client import LLMConfig
-from .scene_generator import propose_drop_start, settle_object_with_physics
-from .sg_cache import load_global_sg_pkl
+from .scene_generator import propose_drop_start, settle_object_with_physics, check_navmesh_proximity
+from .sg_cache import load_global_sg_pkl, node_centroid_world, iter_nodes
 
 
 def _write_records(path: Path, records: List[Dict[str, Any]]) -> None:
@@ -43,6 +43,7 @@ def build_record(
     llm_cfg: Optional[LLMConfig] = None,
     llm_use_snapshots: str = "auto",
     llm_max_images: int = 6,
+    max_navmesh_dist: float = 2.0,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Build a Krutik-style DynamicQA record.
@@ -76,17 +77,65 @@ def build_record(
         print(f"[DynamicQA] scene_handle={scene_handle_abs}")
         print(f"[DynamicQA] object_category={inserted_object_category}")
         print(f"[DynamicQA] template_handle={template_handle_abs}")
+        print(f"[DynamicQA] max_navmesh_dist={max_navmesh_dist}m")
 
-    a, b = select_support_pair(sg, inserted_object_category)
+    # --- Navmesh-aware support selection ---
+    nodes = list(iter_nodes(sg))
+    all_candidates = get_all_support_candidates(sg, inserted_object_category)
+    if len(all_candidates) < 2:
+        raise ValueError(
+            f"Not enough support candidates for '{inserted_object_category}'. "
+            f"Found {len(all_candidates)} candidates."
+        )
 
-    nodes = sg.get("nodes") or []
-    support_a = nodes[a.node_idx]
-    support_b = nodes[b.node_idx]
+    # Pre-filter candidates by navmesh proximity of their centroid
+    rng = np.random.default_rng(seed)
+    centroids = []
+    for c in all_candidates:
+        cent = node_centroid_world(nodes[c.node_idx])
+        if cent is not None:
+            centroids.append(cent.tolist())
+        else:
+            centroids.append([0.0, 0.0, 0.0])
+
+    nav_dists = check_navmesh_proximity(scene_handle_abs, centroids)
+
+    valid_candidates: List[SupportChoice] = []
+    for c, d in zip(all_candidates, nav_dists):
+        if verbose:
+            print(f"[DynamicQA]   candidate '{c.caption}' (idx={c.node_idx}, room={c.room_idx}) navmesh_dist={d:.2f}m", end="")
+        if d <= max_navmesh_dist:
+            valid_candidates.append(c)
+            if verbose:
+                print(" ✓")
+        else:
+            if verbose:
+                print(f" ✗ (>{max_navmesh_dist}m)")
+
+    if len(valid_candidates) < 2:
+        raise ValueError(
+            f"Not enough navmesh-reachable support candidates for '{inserted_object_category}'. "
+            f"Found {len(valid_candidates)} valid (within {max_navmesh_dist}m of navmesh) "
+            f"out of {len(all_candidates)} total. "
+            f"Try increasing --max_navmesh_dist."
+        )
+
+    # Pick A/B: prefer distinct rooms
+    a = valid_candidates[0]
+    b = None
+    if a.room_idx is not None:
+        for c in valid_candidates[1:]:
+            if c.room_idx is not None and c.room_idx != a.room_idx:
+                b = c
+                break
+    if b is None:
+        b = valid_candidates[1]
 
     if verbose:
         print(f"[DynamicQA] Selected supports: A=({a.node_idx}) '{a.caption}', B=({b.node_idx}) '{b.caption}'")
 
-    rng = np.random.default_rng(seed)
+    support_a = nodes[a.node_idx]
+    support_b = nodes[b.node_idx]
 
     placement_a: Dict[str, Any] = {
         "support_node_idx": a.node_idx,
@@ -102,20 +151,26 @@ def build_record(
     if verbose:
         print(f"[DynamicQA] Proposed drop starts: A={placement_a['start_position']}, B={placement_b['start_position']}")
 
-    if run_physics:
-        if verbose:
-            print("[DynamicQA] Running physics settling...")
-        settled_a = settle_object_with_physics(scene_handle_abs, template_handle_abs, placement_a["start_position"])
-        settled_b = settle_object_with_physics(scene_handle_abs, template_handle_abs, placement_b["start_position"])
-        placement_a["position"] = settled_a.position
-        placement_a["rotation_quat_xyzw"] = settled_a.rotation_quat_xyzw
-        placement_a["settle_steps"] = settled_a.steps
-        placement_b["position"] = settled_b.position
-        placement_b["rotation_quat_xyzw"] = settled_b.rotation_quat_xyzw
-        placement_b["settle_steps"] = settled_b.steps
-        if verbose:
-            print(f"[DynamicQA] Settled A pos={settled_a.position} rot={settled_a.rotation_quat_xyzw} steps={settled_a.steps}")
-            print(f"[DynamicQA] Settled B pos={settled_b.position} rot={settled_b.rotation_quat_xyzw} steps={settled_b.steps}")
+    # Always settle — uses Bullet physics if available, geometric fallback otherwise
+    if verbose:
+        print("[DynamicQA] Running object settling...")
+    settled_a = settle_object_with_physics(scene_handle_abs, template_handle_abs, placement_a["start_position"])
+    settled_b = settle_object_with_physics(scene_handle_abs, template_handle_abs, placement_b["start_position"])
+    placement_a["position"] = settled_a.position
+    placement_a["rotation_quat_xyzw"] = settled_a.rotation_quat_xyzw
+    placement_a["settle_steps"] = settled_a.steps
+    placement_a["settled_with_physics"] = settled_a.settled
+    placement_a["navmesh_dist"] = settled_a.navmesh_dist
+    placement_b["position"] = settled_b.position
+    placement_b["rotation_quat_xyzw"] = settled_b.rotation_quat_xyzw
+    placement_b["settle_steps"] = settled_b.steps
+    placement_b["settled_with_physics"] = settled_b.settled
+    placement_b["navmesh_dist"] = settled_b.navmesh_dist
+    if verbose:
+        mode = "Bullet physics" if settled_a.settled else "geometric"
+        print(f"[DynamicQA] Settled A ({mode}) pos={settled_a.position} navmesh_dist={settled_a.navmesh_dist:.2f}m")
+        mode = "Bullet physics" if settled_b.settled else "geometric"
+        print(f"[DynamicQA] Settled B ({mode}) pos={settled_b.position} navmesh_dist={settled_b.navmesh_dist:.2f}m")
 
     if qa_mode == "llm":
         llm_cfg = llm_cfg or LLMConfig()
@@ -191,7 +246,7 @@ def main() -> None:
         help="Habitat-Sim object template config (e.g., *.object_config.json)",
     )
     ap.add_argument("--output", required=True, help="Output manifest path (.jsonl or .json)")
-    ap.add_argument("--run_physics", action="store_true", help="Run physics settling (requires Bullet)")
+    ap.add_argument("--run_physics", action="store_true", help="(Legacy) Physics settling always runs; uses Bullet if available, geometric fallback otherwise")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=None, help="Optional cap on number of records")
 
@@ -237,6 +292,9 @@ def main() -> None:
         help="Print progress dots while waiting for the LLM (requires streaming).",
     )
     ap.add_argument("--verbose", action="store_true", help="Print debug info for dataset generation")
+    ap.add_argument("--max_navmesh_dist", type=float, default=2.0,
+                    help="Max distance (m) from placement centroid to nearest navigable point. "
+                         "Supports beyond this are rejected. Default: 2.0")
 
     args = ap.parse_args()
 
@@ -270,6 +328,7 @@ def main() -> None:
             llm_cfg=llm_cfg,
             llm_use_snapshots=str(args.llm_use_snapshots),
             llm_max_images=int(args.llm_max_images),
+            max_navmesh_dist=float(args.max_navmesh_dist),
             verbose=bool(args.verbose),
         )
         records.append(rec)

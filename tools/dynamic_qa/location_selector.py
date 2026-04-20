@@ -54,6 +54,53 @@ def _room_idx(node: Dict[str, Any]) -> Optional[int]:
     return int(ridx) if ridx is not None else None
 
 
+def get_all_support_candidates(
+    sg: SerializedSceneGraph,
+    inserted_object_category: str,
+    support_types_override: Optional[Sequence[str]] = None,
+) -> List[SupportChoice]:
+    """Return all support candidates ranked by priority (no pairing logic)."""
+    obj = inserted_object_category.lower().strip()
+    support_types = (
+        [s.lower() for s in support_types_override]
+        if support_types_override
+        else OBJECT_TO_SUPPORT_TYPES.get(obj, DEFAULT_SUPPORT_TYPES)
+    )
+
+    nodes = list(iter_nodes(sg))
+    idx_by_caption: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    for i, n in enumerate(nodes):
+        cap = node_caption(n).lower()
+        idx_by_caption.setdefault(cap, []).append((i, n))
+
+    pools: List[List[Tuple[int, Dict[str, Any]]]] = []
+    for cap in support_types:
+        if cap in idx_by_caption:
+            pools.append(idx_by_caption[cap])
+
+    if not pools:
+        supports = candidate_support_nodes(sg, require_pcd=True)
+        surface_supports = [
+            n for n in supports if node_caption(n).lower() not in NON_SURFACE_OBJECTS
+        ]
+        if not surface_supports:
+            return []
+        pools = [[(nodes.index(n), n) for n in surface_supports[:50] if n in nodes]]
+
+    flat: List[Tuple[int, Dict[str, Any]]] = []
+    for p in pools:
+        flat.extend(p)
+
+    seen: set = set()
+    result: List[SupportChoice] = []
+    for idx, n in flat:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        result.append(SupportChoice(node_idx=idx, caption=node_caption(n), room_idx=_room_idx(n)))
+    return result
+
+
 def select_support_pair(
     sg: SerializedSceneGraph,
     inserted_object_category: str,

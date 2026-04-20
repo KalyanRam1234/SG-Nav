@@ -260,8 +260,9 @@ class SG_Nav_Agent():
     def inject_cad_object(self, template_handle, position, rotation_quat=None, scale=None):
         """Inject a rigid CAD object into the live Habitat-Sim scene.
 
-        The object is placed as STATIC so it stays fixed during navigation.
-        Returns the Habitat rigid object handle, or None on failure.
+        Scale must be applied on the template BEFORE creating the object,
+        because habitat-sim 0.2.4 does not support obj.scale as a setter.
+        Returns the Habitat rigid object, or None on failure.
         """
         try:
             import magnum as mn
@@ -280,22 +281,37 @@ class SG_Nav_Agent():
                 print(f"[Inject] ERROR: could not load template {template_handle}")
                 return None
             template_id = template_ids[0]
+
+            # Apply scale on the template before instantiation
+            if scale is not None:
+                s = float(scale)
+                tmpl = obj_tmpl_mgr.get_template_by_id(template_id)
+                tmpl.scale = mn.Vector3(s, s, s)
+                obj_tmpl_mgr.register_template(tmpl)
+                print(f"[Inject] Applied template scale={s}")
+
             obj = rigid_mgr.add_object_by_template_id(template_id)
 
-            obj.motion_type = habitat_sim.physics.MotionType.STATIC
+            # KINEMATIC allows position updates even without Bullet physics;
+            # STATIC silently ignores translation when Bullet is absent.
+            obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
             obj.translation = mn.Vector3(*[float(v) for v in position])
 
+            # Verify translation was applied
+            actual = obj.translation
+            print(f"[Inject] Set position={position}, readback=[{actual.x:.4f}, {actual.y:.4f}, {actual.z:.4f}]")
+            print(f"[Inject] motion_type={obj.motion_type}, object_id={obj.object_id}")
+            bb = obj.root_scene_node.cumulative_bb
+            print(f"[Inject] local AABB: min=[{bb.min.x:.4f},{bb.min.y:.4f},{bb.min.z:.4f}] "
+                  f"max=[{bb.max.x:.4f},{bb.max.y:.4f},{bb.max.z:.4f}]")
+
             if rotation_quat is not None:
-                # rotation_quat is [x, y, z, w]
                 obj.rotation = mn.Quaternion(
                     mn.Vector3(float(rotation_quat[0]),
                                float(rotation_quat[1]),
                                float(rotation_quat[2])),
                     float(rotation_quat[3])
                 )
-            if scale is not None:
-                s = float(scale)
-                obj.scale = mn.Vector3(s, s, s)
 
             self._injected_objects.append(obj)
             print(f"[Inject] Placed object at {position} (template={template_handle})")
@@ -334,6 +350,8 @@ class SG_Nav_Agent():
                 return
 
         variant_idx = int(self._inject_variant)
+        # CLI scale override (--inject_scale); falls back to per-placement scale
+        cli_scale = getattr(self.args, 'inject_scale', None)
         for record in records:
             placements = record.get('validPlacements', [])
             if variant_idx >= len(placements):
@@ -344,9 +362,11 @@ class SG_Nav_Agent():
             template = record.get('template_handle', '')
             position = placement.get('position', [0, 0, 0])
             rotation = placement.get('rotation', None)
+            scale = cli_scale or placement.get('scale', None)
             cat = record.get('object_category', 'unknown')
-            print(f"[Inject] Injecting '{cat}' variant={variant_idx} into scene")
-            self.inject_cad_object(template, position, rotation)
+            print(f"[Inject] Injecting '{cat}' variant={variant_idx} into scene"
+                  f" scale={scale}")
+            self.inject_cad_object(template, position, rotation, scale=scale)
 
     @staticmethod
     def _scene_matches(manifest_scene, episode_scene):
@@ -366,6 +386,164 @@ class SG_Nav_Agent():
         if m_key and e_key:
             return m_key[-1] == e_key[-1]
         return manifest_scene in episode_scene or episode_scene in manifest_scene
+
+    # ── Injection Visualization ─────────────────────────────────────────
+
+    def _get_injection_vis_dir(self):
+        """Return (and create) the injection_frames/ subfolder."""
+        d = os.path.join(self.visualization_dir, 'injection_frames')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _get_injection_position(self):
+        """Return the 3D position [x, y, z] of the first injected object, or None."""
+        if not self._inject_manifest:
+            return None
+        rec_idx = int(self._inject_record_idx) if self._inject_record_idx is not None else 0
+        if rec_idx >= len(self._inject_manifest):
+            return None
+        variant_idx = int(self._inject_variant)
+        placements = self._inject_manifest[rec_idx].get('validPlacements', [])
+        if variant_idx >= len(placements):
+            return None
+        return placements[variant_idx].get('position', None)
+
+    def save_injection_confirmation(self, observations):
+        """Save post-injection frames: agent-view + camera-teleported view looking at the object."""
+        if not self._injected_objects or not self.args.visualize:
+            return
+        import cv2
+        import numpy as np
+        inject_dir = self._get_injection_vis_dir()
+        cat = getattr(self, 'obj_goal', 'unknown')
+        pos = self._get_injection_position()
+
+        # --- 1. Save the agent's spawn-view frame (as before) ---
+        rgb = observations["rgb"]
+        bgr = rgb[:, :, ::-1].copy()
+        cv2.putText(bgr, f"AGENT-VIEW  goal={cat}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if pos:
+            cv2.putText(bgr, f"Object at [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        agent_view_path = os.path.join(inject_dir, f"inject_step0_ep{self.count_episodes:04d}_rgb.png")
+        cv2.imwrite(agent_view_path, bgr)
+
+        # --- 2. Teleport camera to look at the injected object and save ---
+        if pos is not None:
+            self._save_injection_lookat_frame(pos, cat, inject_dir)
+
+        print(f"[Inject-Vis] Saved injection confirmation → {inject_dir}")
+
+    def _save_injection_lookat_frame(self, target_pos, category, inject_dir):
+        """Teleport the agent to face the injection point, render, save, then restore."""
+        import cv2
+        import numpy as np
+
+        try:
+            import magnum as mn
+            sim = self.simulator._env._sim
+            agent = sim.get_agent(0)
+            agent_state = agent.get_state()
+            original_pos = agent_state.position
+            original_rot = agent_state.rotation
+
+            target = np.array(target_pos, dtype=np.float64)
+
+            # Place camera 0.8m away. The RGB sensor is 0.88m above the agent
+            # position, so offset the agent Y downward to put the camera at
+            # object height.
+            offset_dist = 0.8
+            sensor_height = 0.88
+            # Try multiple angles to find a viewpoint (some may be inside walls)
+            angles = [0, np.pi/4, np.pi/2, 3*np.pi/4, np.pi,
+                      5*np.pi/4, 3*np.pi/2, 7*np.pi/4]
+
+            frames_saved = 0
+            for i, angle in enumerate(angles):
+                # Camera position: offset from target in XZ plane
+                cam_x = target[0] + offset_dist * np.cos(angle)
+                cam_z = target[2] + offset_dist * np.sin(angle)
+                cam_y = target[1] - sensor_height  # agent Y so camera is at object height
+                cam_pos = np.array([cam_x, cam_y, cam_z])
+
+                # Compute look-at rotation: camera looks from cam_pos toward target
+                forward = target - cam_pos
+                forward[1] = 0  # keep horizontal
+                fwd_len = np.linalg.norm(forward)
+                if fwd_len < 1e-6:
+                    continue
+                forward = forward / fwd_len
+
+                # Yaw angle from -Z axis (Habitat convention: agent faces -Z)
+                yaw = np.arctan2(-forward[0], -forward[2])
+
+                # Build quaternion from yaw (rotation around Y axis)
+                from habitat_sim.utils.common import quat_from_angle_axis
+                rot = quat_from_angle_axis(float(yaw), np.array([0.0, 1.0, 0.0]))
+
+                # Teleport
+                new_state = agent.get_state()
+                new_state.position = cam_pos
+                new_state.rotation = rot
+                agent.set_state(new_state)
+
+                # Render
+                sim_obs = sim.get_sensor_observations()
+                fresh = sim._sensor_suite.get_observations(sim_obs)
+                rgb = fresh.get("rgb")
+                if rgb is None:
+                    continue
+
+                bgr = rgb[:, :, ::-1].copy()
+                label = f"LOOK-AT ({i}) goal={category}"
+                cv2.putText(bgr, label, (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(bgr, f"Obj@[{target[0]:.2f},{target[1]:.2f},{target[2]:.2f}]",
+                            (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.putText(bgr, f"Cam@[{cam_x:.2f},{cam_y:.2f},{cam_z:.2f}]",
+                            (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 2)
+
+                # Draw crosshair at image center (where the object should be)
+                h, w = bgr.shape[:2]
+                cx, cy = w // 2, h // 2
+                cv2.drawMarker(bgr, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
+
+                path = os.path.join(inject_dir,
+                    f"inject_lookat{i}_ep{self.count_episodes:04d}_rgb.png")
+                cv2.imwrite(path, bgr)
+                frames_saved += 1
+
+            # Restore agent to original position
+            restore_state = agent.get_state()
+            restore_state.position = original_pos
+            restore_state.rotation = original_rot
+            agent.set_state(restore_state)
+
+            # Re-render original view so downstream code isn't affected
+            sim_obs = sim.get_sensor_observations()
+            sim._prev_sim_obs = sim_obs
+
+            print(f"[Inject-Vis] Saved {frames_saved} look-at frames around injection point")
+        except Exception as e:
+            print(f"[Inject-Vis] WARNING: Could not render look-at frames: {e}")
+
+    def _save_injection_pano_frame(self, observations, step):
+        """Save a raw RGB frame during panoramic scanning (steps 1-22)."""
+        if not self._injected_objects or not self.args.visualize:
+            return
+        import cv2
+        inject_dir = self._get_injection_vis_dir()
+
+        rgb = observations["rgb"]
+        bgr = rgb[:, :, ::-1].copy()
+
+        cat = getattr(self, 'obj_goal', 'unknown')
+        cv2.putText(bgr, f"Pano {step}/22  goal={cat}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        path = os.path.join(inject_dir, f"pano_step{step:03d}_ep{self.count_episodes:04d}_rgb.png")
+        cv2.imwrite(path, bgr)
 
     def add_predicates(self, model):
         predicate = Predicate('IsNearObj', closed = True, size = 2)
@@ -464,7 +642,13 @@ class SG_Nav_Agent():
         print(f"[Episode Reset] Episode {self.count_episodes}/{total_episodes} | "
               f"ID: {episode.episode_id} | Scene: {episode.scene_id.split('/')[-2]} | "
               f"Goal: {self.obj_goal}")
-        print(f"{'='*80}\n")
+        print(f"{'='*80}")
+        try:
+            agent_state = self.simulator._env.sim.get_agent(0).get_state()
+            print(f"[Episode Reset] Agent start position: {agent_state.position}")
+        except Exception:
+            pass
+        print()
         self.current_obj_predictions = []
         self.obj_locations = [[] for i in range(self.num_cooccur_objects)]
         self.not_move_steps = 0
@@ -1022,6 +1206,10 @@ class SG_Nav_Agent():
 
         _step_t0 = time.perf_counter()
 
+        # Save injection confirmation on the very first step
+        if self._injected_objects and self.total_steps == 0:
+            self.save_injection_confirmation(observations)
+
         print(f"[Act] Processing observations - depth clipping...")
         observations["depth"][observations["depth"]==0.5] = 100 # don't construct unprecise map with distance less than 0.5 m
         self.depth = observations["depth"]
@@ -1086,6 +1274,8 @@ class SG_Nav_Agent():
                 vis = add_text_list(vis, line_list(', '.join(node_names), 40), (550, 80), font_scale=0.3, thickness=1)
             vis = vis[:, :, ::-1]
             self.visualize_image_list.append(vis)
+            # Save raw RGB to injection_frames/ for easy inspection
+            self._save_injection_pano_frame(observations, self.total_steps)
 
         if self.total_steps == 1:
             print(f"[Act] Step 1: Setting view angle to 30 degrees (initial lookup)")
@@ -2165,6 +2355,10 @@ def main():
     parser.add_argument(
         "--inject_record_idx", default=None, type=int,
         help="Inject a specific record index from the manifest (default: auto-match by scene)"
+    )
+    parser.add_argument(
+        "--inject_scale", default=1.0, type=float,
+        help="Scale override for injected objects (e.g. 3.0 = 3x size)"
     )
     args = parser.parse_args()
     _reserve_gpu_memory(args.reserve_gpu_gb)
