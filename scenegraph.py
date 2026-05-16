@@ -867,8 +867,8 @@ Object pair(s):
             print(f"[Segment2D] Recovery: kept best detection (conf={conf[0]:.3f})")
 
         # Reject low-confidence detections
-        if conf[0] < 0.3:
-            print(f"[Segment2D] Recovery: rejected (conf={conf[0]:.3f} < 0.30)")
+        if conf[0] < 0.35:
+            print(f"[Segment2D] Recovery: rejected (conf={conf[0]:.3f} < 0.35)")
             return None, None, None, None
 
         return mask, xyxy, conf, caption
@@ -1416,7 +1416,7 @@ Object pair(s):
             prev_count = len(self.objects)
             self.objects = periodic_merge_objects(
                 self.cfg, self.objects,
-                centroid_thresh=0.5, visual_thresh=0.6)
+                centroid_thresh=0.4, visual_thresh=0.7)
             if len(self.objects) < prev_count:
                 self.objects_post = filter_objects(self.cfg, self.objects, small_object_classes=set(self.small_objects))
                 self._prune_stale_nodes()

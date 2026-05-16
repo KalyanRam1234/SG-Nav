@@ -124,8 +124,8 @@ def aggregate_similarities(cfg, spatial_sim: torch.Tensor, visual_sim: torch.Ten
     Returns:
         MxN aggregated similarity matrix
     '''
-    w_spatial = getattr(cfg, 'w_spatial', 0.5)
-    w_visual = getattr(cfg, 'w_visual', 0.5)
+    w_spatial = getattr(cfg, 'w_spatial', 0.4)
+    w_visual = getattr(cfg, 'w_visual', 0.6)
     agg_sim = w_spatial * spatial_sim + w_visual * visual_sim
 
     if class_mask is not None:
@@ -158,8 +158,8 @@ def merge_detections_to_objects(
 
 
 def dedup_detections(cfg, detection_list: DetectionList,
-                     centroid_thresh: float = 0.5,
-                     visual_thresh: float = 0.5) -> DetectionList:
+                     centroid_thresh: float = 0.3,
+                     visual_thresh: float = 0.75) -> DetectionList:
     """Deduplicate detections within a single frame before adding to the map.
 
     Merges pairs that share the same category AND have centroids within
@@ -236,8 +236,8 @@ def dedup_detections(cfg, detection_list: DetectionList,
 
 
 def periodic_merge_objects(cfg, objects: MapObjectList,
-                           centroid_thresh: float = 0.5,
-                           visual_thresh: float = 0.6) -> MapObjectList:
+                           centroid_thresh: float = 0.4,
+                           visual_thresh: float = 0.7) -> MapObjectList:
     """Post-hoc deduplication pass over the full object list.
 
     Finds pairs of existing objects that share the same class (synonym-aware)
