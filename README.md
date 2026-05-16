@@ -152,9 +152,18 @@ cd /home/kalyan/20-Credits/SG-Nav && python -m tools.visualize_sg_match \
    --cad_category cup \
    --cad_template_handle /home/kalyan/20-Credits/SG-Nav/data/scene_datasets/objects/example_objects/cup.object_config.json \
    --scene_handle /home/kalyan/20-Credits/SG-Nav/data/MatterPort3D/mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb \
-   --output data/dynamicqa/manifest.jsonl \
+   --output data/dynamicqa/manifest_new.jsonl \
    --verbose --run_physics
 
+   python -m tools.dynamic_qa.build_dataset \
+   --sg_pkl data/scenegraph_saves/experiment_0/[0:11]/run_20260418_164703/global_sg_goal_table_3_moving_on_post_300_steps_20260418_205439.pkl \
+   --cad_category cup \
+   --cad_template_handle /home/kalyan/20-Credits/SG-Nav/data/scene_datasets/objects/example_objects/cup.object_config.json \
+   --scene_handle /home/kalyan/20-Credits/SG-Nav/data/MatterPort3D/mp3d/2azQ1b91cZZ/2azQ1b91cZZ.glb \
+   --output data/dynamicqa/manifest_latest.jsonl \
+   --verbose --run_physics
+
+/home/kalyan/20-Credits/SG-Nav/
  python SG_Nav.py \
    --inject_manifest data/dynamicqa/manifest.jsonl \
    --inject_variant 0 \
@@ -166,3 +175,9 @@ cd /home/kalyan/20-Credits/SG-Nav && python -m tools.visualize_sg_match \
   --sg1 data/usefulruns/runs-with-enhanced-sg/global_sg_goal_sofa_3_found_20260411_083018.pkl \
   --sg2 data/usefulruns/runs-with-enhanced-sg/global_sg_goal_picture_7_found_20260413_100013.pkl \
   --mode dynamic --refine-iters 2 --verbose 2>&1 | tail -80
+
+ python -m tools.sg_match --sg1 data/usefulruns/runs-with-enhanced-sg/global_sg_goal_sofa_3_found_20260411_083018.pkl --sg2 data/usefulruns/runs-with-enhanced-sg/global_sg_goal_picture_7_found_20260413_100013.pkl --mode dynamic --refine-iters 2
+
+ i am noticing that when we inject the object, see the manifest.jsonl or the manifest_new.jsonl or the manifeset_latest.jsonl files, the cup is getting detected in the panaromic stage, rather the recover pass is always detecting it but in the visualization i can't properly see the effect of injection, rather i can't see the cup from the frames saved, but seems like the cup is getting detected in the panoramic stage, so maybe the injection is working but the visualization is not showing it properly. Can you check this out, what can we change here? Is it an issue with the code of sg_nav or issue with the build_dataset code?
+
+ placement of cup should be able to account for the input of the agent position, and we should be able to configure how far the cup should be placed, additionally we should have a mechanism to have the llm have full context of the scene, so that it knows what rooms are present, and be able to provide suggestions on placing objects in same room different places and also in different rooms, so that we can have a variety of questions that can be generated. We can also have a mechanism to have the llm generate questions based on the current state of the scene, so that we can have more realistic questions that are relevant to the current state of the scene. Finally also be able to configure how many questions we want to generate for each scene, and also be able to have a mechanism to filter out questions that are not relevant or not answerable based on the current state of the scene. This way we can have a more diverse and realistic set of questions that can be used for training and evaluation of the models.

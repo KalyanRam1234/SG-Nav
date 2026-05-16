@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from .location_selector import select_support_pair, get_all_support_candidates, SupportChoice
+from .placement_llm import suggest_placements_llm
 from .qa_generator import generate_qa_pairs
 from .qa_llm import generate_qa_pairs_llm
 from .llm_client import LLMConfig
@@ -43,6 +44,7 @@ def build_record(
     llm_cfg: Optional[LLMConfig] = None,
     llm_use_snapshots: str = "auto",
     llm_max_images: int = 6,
+    placement_mode: str = "heuristic",
     max_navmesh_dist: float = 2.0,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -56,6 +58,9 @@ def build_record(
       - validPlacements (list of {position, rotation})
 
     Note: we map variant A/B placements to validPlacements[0]/[1].
+    
+    Args:
+        placement_mode: "heuristic" (existing room-aware logic) or "llm" (LLM-based suggestion)
     """
 
     save = load_global_sg_pkl(sg_pkl)
@@ -77,59 +82,82 @@ def build_record(
         print(f"[DynamicQA] scene_handle={scene_handle_abs}")
         print(f"[DynamicQA] object_category={inserted_object_category}")
         print(f"[DynamicQA] template_handle={template_handle_abs}")
+        print(f"[DynamicQA] placement_mode={placement_mode}")
         print(f"[DynamicQA] max_navmesh_dist={max_navmesh_dist}m")
 
-    # --- Navmesh-aware support selection ---
+    # --- Placement Selection ---
     nodes = list(iter_nodes(sg))
-    all_candidates = get_all_support_candidates(sg, inserted_object_category)
-    if len(all_candidates) < 2:
-        raise ValueError(
-            f"Not enough support candidates for '{inserted_object_category}'. "
-            f"Found {len(all_candidates)} candidates."
-        )
-
-    # Pre-filter candidates by navmesh proximity of their centroid
     rng = np.random.default_rng(seed)
-    centroids = []
-    for c in all_candidates:
-        cent = node_centroid_world(nodes[c.node_idx])
-        if cent is not None:
-            centroids.append(cent.tolist())
-        else:
-            centroids.append([0.0, 0.0, 0.0])
-
-    nav_dists = check_navmesh_proximity(scene_handle_abs, centroids)
-
-    valid_candidates: List[SupportChoice] = []
-    for c, d in zip(all_candidates, nav_dists):
+    
+    if placement_mode.lower() == "llm":
+        # LLM-based intelligent placement selection
         if verbose:
-            print(f"[DynamicQA]   candidate '{c.caption}' (idx={c.node_idx}, room={c.room_idx}) navmesh_dist={d:.2f}m", end="")
-        if d <= max_navmesh_dist:
-            valid_candidates.append(c)
-            if verbose:
-                print(" ✓")
-        else:
-            if verbose:
-                print(f" ✗ (>{max_navmesh_dist}m)")
+            print(f"[DynamicQA] Using LLM-based placement selection...")
+        try:
+            llm_placements = suggest_placements_llm(
+                sg,
+                inserted_object_category,
+                llm_cfg=llm_cfg,
+                verbose=verbose,
+            )
+            if len(llm_placements) < 2:
+                raise ValueError(f"LLM returned {len(llm_placements)} placements, need 2")
+            a, b = llm_placements[0], llm_placements[1]
+        except Exception as e:
+            print(f"[DynamicQA] WARNING: LLM placement failed: {e}")
+            print(f"[DynamicQA] Falling back to heuristic placement...")
+            placement_mode = "heuristic"
+    
+    if placement_mode.lower() != "llm":
+        # Heuristic: Navmesh-aware support selection
+        all_candidates = get_all_support_candidates(sg, inserted_object_category)
+        if len(all_candidates) < 2:
+            raise ValueError(
+                f"Not enough support candidates for '{inserted_object_category}'. "
+                f"Found {len(all_candidates)} candidates."
+            )
 
-    if len(valid_candidates) < 2:
-        raise ValueError(
-            f"Not enough navmesh-reachable support candidates for '{inserted_object_category}'. "
-            f"Found {len(valid_candidates)} valid (within {max_navmesh_dist}m of navmesh) "
-            f"out of {len(all_candidates)} total. "
-            f"Try increasing --max_navmesh_dist."
-        )
+        # Pre-filter candidates by navmesh proximity of their centroid
+        centroids = []
+        for c in all_candidates:
+            cent = node_centroid_world(nodes[c.node_idx])
+            if cent is not None:
+                centroids.append(cent.tolist())
+            else:
+                centroids.append([0.0, 0.0, 0.0])
 
-    # Pick A/B: prefer distinct rooms
-    a = valid_candidates[0]
-    b = None
-    if a.room_idx is not None:
-        for c in valid_candidates[1:]:
-            if c.room_idx is not None and c.room_idx != a.room_idx:
-                b = c
-                break
-    if b is None:
-        b = valid_candidates[1]
+        nav_dists = check_navmesh_proximity(scene_handle_abs, centroids)
+
+        valid_candidates: List[SupportChoice] = []
+        for c, d in zip(all_candidates, nav_dists):
+            if verbose:
+                print(f"[DynamicQA]   candidate '{c.caption}' (idx={c.node_idx}, room={c.room_idx}) navmesh_dist={d:.2f}m", end="")
+            if d <= max_navmesh_dist:
+                valid_candidates.append(c)
+                if verbose:
+                    print(" ✓")
+            else:
+                if verbose:
+                    print(f" ✗ (>{max_navmesh_dist}m)")
+
+        if len(valid_candidates) < 2:
+            raise ValueError(
+                f"Not enough navmesh-reachable support candidates for '{inserted_object_category}'. "
+                f"Found {len(valid_candidates)} valid (within {max_navmesh_dist}m of navmesh) "
+                f"out of {len(all_candidates)} total. "
+                f"Try increasing --max_navmesh_dist."
+            )
+
+        # Pick A/B: prefer distinct rooms
+        a = valid_candidates[0]
+        b = None
+        if a.room_idx is not None:
+            for c in valid_candidates[1:]:
+                if c.room_idx is not None and c.room_idx != a.room_idx:
+                    b = c
+                    break
+        if b is None:
+            b = valid_candidates[1]
 
     if verbose:
         print(f"[DynamicQA] Selected supports: A=({a.node_idx}) '{a.caption}', B=({b.node_idx}) '{b.caption}'")
@@ -250,6 +278,14 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=None, help="Optional cap on number of records")
 
+    ap.add_argument(
+        "--placement_mode",
+        choices=["heuristic", "llm"],
+        default="llm",
+        help="Strategy for selecting placement surfaces: 'llm' (LLM-based intelligent suggestion, default) "
+             "or 'heuristic' (room-aware + navmesh fallback)"
+    )
+
     ap.add_argument("--qa_mode", choices=["templated", "llm"], default="templated")
     ap.add_argument("--qa_count", type=int, default=20)
     ap.add_argument("--llm_model", type=str, default="llama3.2-vision:latest")
@@ -328,6 +364,7 @@ def main() -> None:
             llm_cfg=llm_cfg,
             llm_use_snapshots=str(args.llm_use_snapshots),
             llm_max_images=int(args.llm_max_images),
+            placement_mode=str(args.placement_mode),
             max_navmesh_dist=float(args.max_navmesh_dist),
             verbose=bool(args.verbose),
         )

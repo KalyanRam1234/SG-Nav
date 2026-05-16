@@ -257,6 +257,35 @@ class SG_Nav_Agent():
                     records.append(json.loads(line))
         return records
 
+    def _apply_geometric_settling(self, obj, position):
+        """Apply geometric settling formula to match manifest generation logic.
+
+        When Bullet physics is unavailable, manifest positions are generated
+        using a geometric fallback that assumes: position[1] = surface_height + drop_height(0.4)
+
+        This function recovers the settled position by calculating where the
+        object's bottom should sit on the surface:
+            surface_y = position[1] - 0.4
+            final_y = surface_y - bottom_y_local + margin
+
+        Returns the adjusted position list, or the original position if error.
+        """
+        try:
+            bb = obj.root_scene_node.cumulative_bb
+            bottom_y_local = float(bb.min.y)
+
+            position_list = list(position)
+            surface_y = position_list[1] - 0.4
+            final_y = surface_y - bottom_y_local + 0.002
+
+            position_list[1] = final_y
+            print(f"[Inject] Geometric settling: Y {position_list[1]:.4f} "
+                  f"(surface_y={surface_y:.4f}, bottom_local={bottom_y_local:.4f})")
+            return position_list
+        except Exception as e:
+            print(f"[Inject] WARNING: Could not apply settling: {e}, using position as-is")
+            return list(position)
+
     def inject_cad_object(self, template_handle, position, rotation_quat=None, scale=None):
         """Inject a rigid CAD object into the live Habitat-Sim scene.
 
@@ -295,6 +324,13 @@ class SG_Nav_Agent():
             # KINEMATIC allows position updates even without Bullet physics;
             # STATIC silently ignores translation when Bullet is absent.
             obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
+
+            # Apply geometric settling when Bullet physics unavailable (matches manifest generation)
+            has_bullet = getattr(habitat_sim, "built_with_bullet", False)
+            if not has_bullet:
+                print("BULLET NOT AVAILABLE: applying geometric settling to match manifest generation logic")
+                position = self._apply_geometric_settling(obj, position)
+
             obj.translation = mn.Vector3(*[float(v) for v in position])
 
             # Verify translation was applied

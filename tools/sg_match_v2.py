@@ -33,11 +33,6 @@ def _ts():
     """Compact timestamp for progress messages."""
     return time.strftime("%H:%M:%S")
 
-
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
 class ChangeType(str, Enum):
     SAME = "SAME"
     MOVED = "MOVED"
@@ -129,11 +124,6 @@ class MatchReport:
     accuracy: dict                       # MatchAccuracyReport as dict
     summary: dict
 
-
-# ---------------------------------------------------------------------------
-# Spatial utilities
-# ---------------------------------------------------------------------------
-
 MAP_RESOLUTION = 0.05   # meters per pixel (SG-Nav default)
 MAP_SIZE = 800           # grid dimension
 
@@ -207,11 +197,6 @@ def is_in_explored_area(centroid_3d: np.ndarray,
     if 0 <= row < explored_mask.shape[0] and 0 <= col < explored_mask.shape[1]:
         return bool(explored_mask[row, col])
     return False
-
-
-# ---------------------------------------------------------------------------
-# Feature extraction
-# ---------------------------------------------------------------------------
 
 def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
     """Fast vectorized RGB→HSV.  Input: (N, 3) floats in [0,1]."""
@@ -694,10 +679,6 @@ def compute_neighborhood_features(feats: List[NodeFeatures],
           f"{n_cats} cat bins, {n_rels} relation types")
 
 
-# ---------------------------------------------------------------------------
-# Cost functions
-# ---------------------------------------------------------------------------
-
 # Semantic room similarity (symmetric pairs, sorted alphabetically).
 # Values are similarity in [0,1]: 1.0 = identical, 0.0 = unrelated.
 # Only non-zero off-diagonal pairs need entries; same-caption is always 1.0.
@@ -937,10 +918,6 @@ def dominant_color_cost(a: NodeFeatures, b: NodeFeatures) -> float:
     mean_dist = total_dist / count
     return float(min(mean_dist / 1.0, 1.0))  # normalize to [0, 1]
 
-
-# ---------------------------------------------------------------------------
-# Cost matrix & Hungarian assignment
-# ---------------------------------------------------------------------------
 
 @dataclass
 class MatchWeights:
@@ -1471,10 +1448,6 @@ def compute_edge_relation_accuracy(match_map: dict, edges_1: list,
     return matched_relations / max(total, 1)
 
 
-# ---------------------------------------------------------------------------
-# Match Accuracy Score (MAS)
-# ---------------------------------------------------------------------------
-
 @dataclass
 class MatchAccuracyReport:
     """Comprehensive match accuracy evaluation using held-out / independent signals."""
@@ -1706,11 +1679,6 @@ def compute_match_accuracy(
         score=round(composite, 4),
     )
 
-
-# ---------------------------------------------------------------------------
-# Change detection
-# ---------------------------------------------------------------------------
-
 @dataclass
 class ChangeThresholds:
     """Thresholds for classifying matched pairs (tuned for MAS 78.3%)."""
@@ -1767,10 +1735,6 @@ def classify_match(fa: NodeFeatures, fb: NodeFeatures,
     # UNCERTAIN
     return ChangeType.UNCERTAIN, round(max(0.1, 0.5 - abs(cost - 0.5)), 3)
 
-
-# ---------------------------------------------------------------------------
-# Main matching pipeline
-# ---------------------------------------------------------------------------
 
 def load_scene_graph(filepath: str) -> Tuple[dict, dict]:
     """Load a scene graph and maps from a .pkl file.
@@ -2116,10 +2080,6 @@ def match_scene_graphs(sg1_path: str, sg2_path: str,
     return report
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(
         description="Match two SG-Nav scene graphs and detect changes")
@@ -2266,9 +2226,7 @@ def main():
         n_capacity_overflow_sg2 = 0
         n_rejected_sg2 = len(added)
 
-    # ================================================================
-    # RESULTS TABLE
-    # ================================================================
+
     W = 66
     sep = '=' * W
     thin = '-' * W
